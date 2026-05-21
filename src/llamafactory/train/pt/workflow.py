@@ -18,9 +18,10 @@
 import math
 from typing import TYPE_CHECKING, Optional
 
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, DataCollatorForSeq2Seq
 
 from ...data import get_dataset, get_template_and_fix_tokenizer
+from ...data.megatron import MegatronBlendedDataset, MegatronGPTDataset
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
@@ -31,6 +32,16 @@ if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
 
     from ...hparams import DataArguments, FinetuningArguments, ModelArguments
+
+
+def _is_megatron_module(dataset_module: dict) -> bool:
+    r"""Check whether the dataset module contains a Megatron dataset."""
+    train_ds = dataset_module.get("train_dataset")
+    if isinstance(train_ds, (MegatronGPTDataset, MegatronBlendedDataset)):
+        return True
+    if hasattr(train_ds, "dataset") and isinstance(train_ds.dataset, (MegatronGPTDataset, MegatronBlendedDataset)):
+        return True
+    return False
 
 
 def run_pt(
@@ -44,8 +55,16 @@ def run_pt(
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="pt", **tokenizer_module)
+    if dataset_module.pop("disable_shuffling", False):
+        finetuning_args.disable_shuffling = True
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    if _is_megatron_module(dataset_module):
+        # MegatronGPTDataset already returns unshifted labels aligned with
+        # HF AutoModelForCausalLM expectations; use the standard LM collator.
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    else:
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Initialize our Trainer
     trainer = CustomTrainer(

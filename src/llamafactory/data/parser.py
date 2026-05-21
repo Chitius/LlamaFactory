@@ -28,7 +28,7 @@ class DatasetAttr:
     r"""Dataset attributes."""
 
     # basic configs
-    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file"]
+    load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file", "cloud_file", "megatron", "megatron_list"]
     dataset_name: str
     formatting: Literal["alpaca", "sharegpt", "openai"] = "alpaca"
     ranking: bool = False
@@ -37,6 +37,14 @@ class DatasetAttr:
     split: str = "train"
     folder: str | None = None
     num_samples: int | None = None
+    # megatron configs
+    megatron_path: str | None = None
+    megatron_list_path: str | None = None
+    megatron_seq_length: int | None = None
+    megatron_shuffle_seed: int | None = None
+    megatron_num_samples: int | None = None
+    megatron_data_cache_path: str | None = None
+    megatron_split: str | None = None
     # common columns
     system: str | None = None
     tools: str | None = None
@@ -76,6 +84,13 @@ class DatasetAttr:
         self.set_attr("split", attr, default="train")
         self.set_attr("folder", attr)
         self.set_attr("num_samples", attr)
+        self.set_attr("megatron_path", attr)
+        self.set_attr("megatron_list_path", attr)
+        self.set_attr("megatron_seq_length", attr)
+        self.set_attr("megatron_shuffle_seed", attr)
+        self.set_attr("megatron_num_samples", attr)
+        self.set_attr("megatron_data_cache_path", attr)
+        self.set_attr("megatron_split", attr)
 
         if "columns" in attr:
             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]
@@ -140,6 +155,10 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
             dataset_attr = DatasetAttr("script", dataset_name=dataset_info[name]["script_url"])
         elif "cloud_file_name" in dataset_info[name]:
             dataset_attr = DatasetAttr("cloud_file", dataset_name=dataset_info[name]["cloud_file_name"])
+        elif "megatron_path" in dataset_info[name]:
+            dataset_attr = DatasetAttr("megatron", dataset_name=dataset_info[name]["megatron_path"])
+        elif "megatron_list_path" in dataset_info[name]:
+            dataset_attr = DatasetAttr("megatron_list", dataset_name=dataset_info[name]["megatron_list_path"])
         else:
             dataset_attr = DatasetAttr("file", dataset_name=dataset_info[name]["file_name"])
 

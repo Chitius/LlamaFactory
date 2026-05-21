@@ -143,6 +143,27 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether or not to use a shared file system for the datasets."},
     )
+    megatron_data_cache_path: str | None = field(
+        default=None,
+        metadata={"help": "Directory to cache Megatron dataset indices."},
+    )
+    megatron_reuse_cache: bool = field(
+        default=False,
+        metadata={"help": "Whether to reuse existing Megatron cache files."},
+    )
+    megatron_shuffle_seed: int = field(
+        default=42,
+        metadata={"help": "Random seed for Megatron dataset shuffling."},
+    )
+    megatron_split: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated train/valid/test split ratios for Megatron datasets. "
+                "e.g. '0.9,0.05,0.05' or '1,0,0'. Defaults to '1,0,0'."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):

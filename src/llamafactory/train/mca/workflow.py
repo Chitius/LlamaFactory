@@ -27,6 +27,7 @@ from ...data import (
     get_dataset,
     get_template_and_fix_tokenizer,
 )
+from ...data.parser import get_dataset_list
 from ...data.collator import (
     PairwiseDataCollatorWithPadding,
 )
@@ -57,6 +58,17 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+def _has_megatron_dataset(data_args: "DataArguments") -> bool:
+    r"""Check if any configured dataset is a Megatron dataset."""
+    all_names = (data_args.dataset or []) + (data_args.eval_dataset or [])
+    if not all_names:
+        return False
+    for attr in get_dataset_list(all_names, data_args.dataset_dir):
+        if attr.load_from in ("megatron", "megatron_list"):
+            return True
+    return False
 
 
 def _data_collator_wrapper(data_collator: Any):
@@ -171,10 +183,17 @@ def run_pt(
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
 
+    is_megatron = _has_megatron_dataset(data_args)
+
     # dataset needs +1 then cut back due to MCA shift logic
-    data_args.cutoff_len += 1
+    if not is_megatron:
+        data_args.cutoff_len += 1
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="pt", **tokenizer_module)
-    data_args.cutoff_len -= 1
+    if not is_megatron:
+        data_args.cutoff_len -= 1
+
+    if dataset_module.pop("disable_shuffling", False):
+        finetuning_args.disable_shuffling = True
 
     _check_model_support(model_args)
     model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
@@ -183,7 +202,8 @@ def run_pt(
         pad_to_multiple_of=8,
         label_pad_token_id=IGNORE_INDEX,
     )
-    data_collator = _data_collator_wrapper(data_collator)
+    if not is_megatron:
+        data_collator = _data_collator_wrapper(data_collator)
 
     trainer = CustomMcaTrainer(
         model=model,
@@ -228,10 +248,17 @@ def run_sft(
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
 
+    is_megatron = _has_megatron_dataset(data_args)
+
     # dataset needs +1 then cut back due to MCA shift logic
-    data_args.cutoff_len += 1
+    if not is_megatron:
+        data_args.cutoff_len += 1
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
-    data_args.cutoff_len -= 1
+    if not is_megatron:
+        data_args.cutoff_len -= 1
+
+    if dataset_module.pop("disable_shuffling", False):
+        finetuning_args.disable_shuffling = True
 
     _check_model_support(model_args)
     model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
@@ -250,7 +277,8 @@ def run_sft(
         label_pad_token_id=IGNORE_INDEX,
         **tokenizer_module,
     )
-    data_collator = _data_collator_wrapper(data_collator)
+    if not is_megatron:
+        data_collator = _data_collator_wrapper(data_collator)
 
     trainer = CustomMcaTrainer(
         model=model,
@@ -302,10 +330,17 @@ def run_dpo(
     else:
         ref_model = None
 
+    is_megatron = _has_megatron_dataset(data_args)
+
     # dataset needs +1 then cut back due to MCA shift logic
-    data_args.cutoff_len += 1
+    if not is_megatron:
+        data_args.cutoff_len += 1
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="rm", **tokenizer_module)
-    data_args.cutoff_len -= 1
+    if not is_megatron:
+        data_args.cutoff_len -= 1
+
+    if dataset_module.pop("disable_shuffling", False):
+        finetuning_args.disable_shuffling = True
 
     pad_to_max = training_args.expert_model_parallel_size is not None and training_args.expert_model_parallel_size > 1
     dpo_config = DPOConfig(
@@ -322,7 +357,8 @@ def run_dpo(
         label_pad_token_id=IGNORE_INDEX,
         **tokenizer_module,
     )
-    data_collator = _data_collator_wrapper(data_collator)
+    if not is_megatron:
+        data_collator = _data_collator_wrapper(data_collator)
 
     trainer = McaDPOTrainer(
         model=model,

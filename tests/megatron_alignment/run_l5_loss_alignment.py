@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""L5 Loss Alignment Test: Llama-Factory vs Megatron-LM training losses (standalone).
+
+This script runs two identical training loops side-by-side:
+  - Side A: Llama-Factory style using MegatronGPTDataset + CustomTrainer
+  - Side B: Megatron-style using GPTDataset + raw PyTorch loop
+
+Both use:
+  - The same model weights (DeepSeek V3 0.5B)
+  - The same data order (proven by L4 batch alignment)
+  - The same optimizer (AdamW, lr=1e-4)
+  - Deterministic CUDA / PyTorch settings
+
+After training for K steps, step-by-step losses are compared and a report
+is written to disk.
+"""
+
+import copy
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+from typing import Any, Dict, List
+
+import numpy as np
+import torch
+import transformers
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
+
+from utils import (
+    build_megatron_stubs,
+    check_megatron_source,
+    find_helpers_cpp,
+    load_megatron_module,
+)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+K_STEPS = 5
+MODEL_PATH = "gpt2"
+DATA_PREFIX = os.path.join(os.path.dirname(__file__), "../../data/c4_demo_text_document")
+CACHE_PATH = "/tmp/l5_lf_cache"
+REPORT_PATH = "/tmp/l5_loss_alignment_report.md"
+SEED = 42
+SEQ_LENGTH = 128
+NUM_SAMPLES = 200
+BATCH_SIZE = 2
+LR = 1e-4
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+# =============================================================================
+# Determinism
+# =============================================================================
+
+def _set_deterministic() -> None:
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+    transformers.set_seed(SEED)
+
+
+# =============================================================================
+# Megatron stub loader
+# =============================================================================
+
+_megatron_dir = check_megatron_source(require_helpers_cpp=True)
+build_megatron_stubs(include_tokenizer=True)
+
+load_megatron_module(
+    "megatron.core.datasets.utils",
+    os.path.join(_megatron_dir, "megatron/core/datasets/utils.py"),
+)
+load_megatron_module(
+    "megatron.core.datasets.blended_megatron_dataset_config",
+    os.path.join(_megatron_dir, "megatron/core/datasets/blended_megatron_dataset_config.py"),
+)
+load_megatron_module(
+    "megatron.core.datasets.indexed_dataset",
+    os.path.join(_megatron_dir, "megatron/core/datasets/indexed_dataset.py"),
+)
+load_megatron_module(
+    "megatron.core.datasets.helpers_cpp",
+    find_helpers_cpp(_megatron_dir),
+)
+load_megatron_module(
+    "megatron.core.datasets.helpers",
+    os.path.join(_megatron_dir, "megatron/core/datasets/helpers.py"),
+)
+load_megatron_module(
+    "megatron.core.datasets.megatron_dataset",
+    os.path.join(_megatron_dir, "megatron/core/datasets/megatron_dataset.py"),
+)
+_megatron_gpt_mod = load_megatron_module(
+    "megatron.core.datasets.gpt_dataset",
+    os.path.join(_megatron_dir, "megatron/core/datasets/gpt_dataset.py"),
+)
+_GPTDataset = _megatron_gpt_mod.GPTDataset
+_GPTDatasetConfig = _megatron_gpt_mod.GPTDatasetConfig
+_Split = sys.modules["megatron.core.datasets.utils"].Split
+_FakeTokenizer = sys.modules["megatron.core.tokenizers"].MegatronTokenizerBase
+
+
+# =============================================================================
+# Helper: disable dropout recursively
+# =============================================================================
+
+def _disable_dropout(model: torch.nn.Module) -> None:
+    for mod in model.modules():
+        if isinstance(mod, (torch.nn.Dropout, torch.nn.Dropout1d, torch.nn.Dropout2d, torch.nn.Dropout3d)):
+            mod.p = 0.0
+    if hasattr(model, "config"):
+        for attr in ("dropout", "attention_dropout", "hidden_dropout", "resid_pdrop", "attn_pdrop"):
+            if hasattr(model.config, attr):
+                setattr(model.config, attr, 0.0)
+
+
+# =============================================================================
+# Side A: Llama-Factory
+# =============================================================================
+
+def _build_lf_dataset():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from llamafactory.data.megatron.gpt_dataset import MegatronGPTDataset, MegatronGPTDatasetConfig
+    from llamafactory.data.megatron.indexed_dataset import MegatronIndexedDataset
+
+    if os.path.isdir(CACHE_PATH):
+        shutil.rmtree(CACHE_PATH)
+    os.makedirs(CACHE_PATH, exist_ok=True)
+
+    indexed_ds = MegatronIndexedDataset(DATA_PREFIX, multimodal=False, mmap=True)
+    config = MegatronGPTDatasetConfig(
+        path_prefix=DATA_PREFIX,
+        seq_length=SEQ_LENGTH,
+        seed=SEED,
+        num_samples=NUM_SAMPLES,
+        data_cache_path=CACHE_PATH,
+        add_extra_token=True,
+        drop_last_partial_sequence=True,
+        split="train",
+        pad_token_id=-1,
+    )
+    return MegatronGPTDataset(config, indexed_ds)
+
+
+def _make_training_args():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from llamafactory.hparams.training_args import TrainingArguments
+
+    return TrainingArguments(
+        output_dir="/tmp/l5_lf_output",
+        overwrite_output_dir=True,
+        do_train=True,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=1,
+        learning_rate=LR,
+        num_train_epochs=1.0,
+        lr_scheduler_type="constant",
+        warmup_ratio=0.0,
+        bf16=False,
+        fp16=False,
+        seed=SEED,
+        max_steps=K_STEPS,
+        logging_steps=1,
+        save_steps=999999,
+        disable_tqdm=True,
+        report_to=[],
+        ddp_timeout=180000000,
+        weight_decay=0.0,
+        max_grad_norm=0.0,
+        include_num_input_tokens_seen=False,
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        fp8=False,
+    )
+
+
+class _LossRecorderCallback(transformers.TrainerCallback):
+    def __init__(self):
+        self.losses: List[float] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs:
+            self.losses.append(float(logs["loss"]))
+
+
+def run_lf_side(model: torch.nn.Module, dataset: Any) -> List[float]:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from llamafactory.hparams import FinetuningArguments, ModelArguments
+    from llamafactory.model import load_tokenizer
+    from llamafactory.train.pt.trainer import CustomTrainer
+
+    model_args = ModelArguments(
+        model_name_or_path=MODEL_PATH,
+        trust_remote_code=True,
+        resize_vocab=False,
+        split_special_tokens=False,
+        disable_gradient_checkpointing=True,
+    )
+
+    tokenizer_module = load_tokenizer(model_args)
+    tokenizer = tokenizer_module["tokenizer"]
+
+    training_args = _make_training_args()
+    finetuning_args = FinetuningArguments(
+        stage="pt",
+        finetuning_type="full",
+        plot_loss=False,
+        disable_shuffling=True,
+    )
+
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, pad_to_multiple_of=8)
+
+    trainer = CustomTrainer(
+        model=model,
+        args=training_args,
+        finetuning_args=finetuning_args,
+        data_collator=data_collator,
+        train_dataset=dataset,
+        **tokenizer_module,
+    )
+
+    # Disable num_items_in_batch passing to prevent loss scaling by the model.
+    # The DeepSeek V3 model uses this kwarg to normalize the loss, which would
+    # diverge from a raw PyTorch loop.
+    trainer.model_accepts_loss_kwargs = False
+
+    cb = _LossRecorderCallback()
+    trainer.add_callback(cb)
+    trainer.train()
+
+    # Pad if callback captured fewer entries (shouldn't happen with logging_steps=1)
+    while len(cb.losses) < K_STEPS:
+        cb.losses.append(None)
+
+    return cb.losses[:K_STEPS]
+
+
+# =============================================================================
+# Side B: Megatron GPTDataset + raw loop
+# =============================================================================
+
+def _build_megatron_dataset():
+    indexed_ds = sys.modules["megatron.core.datasets.indexed_dataset"].IndexedDataset(
+        DATA_PREFIX, multimodal=False, mmap=True
+    )
+    config = _GPTDatasetConfig(
+        random_seed=SEED,
+        sequence_length=SEQ_LENGTH,
+        blend=([DATA_PREFIX], None),
+        split="1,0,0",
+        path_to_cache="/tmp/l5_meg_cache",
+        tokenizer=_FakeTokenizer(),
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=True,
+        add_extra_token_to_sequence=True,
+        drop_last_partial_validation_sequence=True,
+    )
+
+    indices = np.arange(len(indexed_ds), dtype=np.int32)
+    dataset = _GPTDataset(
+        indexed_dataset=indexed_ds,
+        dataset_path=DATA_PREFIX,
+        indexed_indices=indices,
+        num_samples=NUM_SAMPLES,
+        index_split=_Split.train,
+        config=config,
+    )
+    return dataset
+
+
+def run_megatron_side(model: torch.nn.Module, dataset: Any) -> List[float]:
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    losses: List[float] = []
+    for step, batch in enumerate(loader):
+        if step >= K_STEPS:
+            break
+
+        # Megatron GPTDataset returns shifted labels, but HF model shifts internally.
+        # Use tokens (unshifted) as both input_ids and labels.
+        input_ids = batch["tokens"].cuda()
+        labels = batch["tokens"].cuda()
+
+        # NOTE: Megatron GPTDataset returns attention_mask as bool, which
+        # causes NaN in this model's SDPA path. Since all sequences are
+        # full-length with no padding, we omit attention_mask and let the
+        # model build its own causal mask.
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        losses.append(loss.item())
+
+    return losses
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("L5 Loss Alignment Test")
+    print("=" * 70)
+
+    _set_deterministic()
+
+    # ------------------------------------------------------------------
+    # Load model once, then clone state dict for both sides
+    # ------------------------------------------------------------------
+    print("[1/5] Loading base model ...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        dtype=torch.float32,
+    )
+    _disable_dropout(base_model)
+    base_state_dict = copy.deepcopy(base_model.state_dict())
+    del base_model
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Side A: Llama-Factory
+    # ------------------------------------------------------------------
+    print("[2/5] Building LF dataset ...")
+    lf_dataset = _build_lf_dataset()
+
+    print("[3/5] Running LF training loop ...")
+    model_a = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        dtype=torch.float32,
+    )
+    _disable_dropout(model_a)
+    model_a.load_state_dict(base_state_dict)
+    model_a.cuda()
+
+    lf_losses = run_lf_side(model_a, lf_dataset)
+    print(f"      LF losses: {lf_losses}")
+
+    del model_a
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Side B: Megatron raw loop
+    # ------------------------------------------------------------------
+    print("[4/5] Building Megatron dataset ...")
+    meg_dataset = _build_megatron_dataset()
+
+    print("[5/5] Running Megatron training loop ...")
+    model_b = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        dtype=torch.float32,
+    )
+    _disable_dropout(model_b)
+    model_b.load_state_dict(base_state_dict)
+    model_b.cuda()
+
+    meg_losses = run_megatron_side(model_b, meg_dataset)
+    print(f"      Meg losses: {meg_losses}")
+
+    del model_b
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+    compare_len = min(K_STEPS, len(lf_losses), len(meg_losses))
+    lf_losses = lf_losses[:compare_len]
+    meg_losses = meg_losses[:compare_len]
+
+    diffs = []
+    report_lines: List[str] = []
+    report_lines.append("# L5 Loss Alignment Report\n")
+    report_lines.append(f"- **Date**: {datetime.now().isoformat()}\n")
+    report_lines.append(f"- **Model**: `{MODEL_PATH}`\n")
+    report_lines.append(f"- **Dataset**: `{DATA_PREFIX}`\n")
+    report_lines.append(f"- **Steps compared**: {compare_len}\n")
+    report_lines.append(f"- **Batch size**: {BATCH_SIZE}\n")
+    report_lines.append(f"- **Sequence length**: {SEQ_LENGTH}\n")
+    report_lines.append(f"- **Seed**: {SEED}\n")
+    report_lines.append(f"- **Learning rate**: {LR}\n")
+    report_lines.append("\n")
+    report_lines.append("| Step | LF Loss | Megatron Loss | Diff | Status |\n")
+    report_lines.append("|------|---------|---------------|------|--------|\n")
+
+    all_pass = True
+    max_diff = 0.0
+    max_diff_step = -1
+
+    for step in range(compare_len):
+        lf = lf_losses[step]
+        mg = meg_losses[step]
+        if lf is None or mg is None:
+            status = "N/A"
+            diff = float("nan")
+        else:
+            diff = abs(lf - mg)
+            diffs.append(diff)
+            status = "PASS" if diff < 1e-4 else "FAIL"
+            if status == "FAIL":
+                all_pass = False
+            if diff > max_diff:
+                max_diff = diff
+                max_diff_step = step
+        report_lines.append(f"| {step:4d} | {lf!s:>9} | {mg!s:>13} | {diff:.2e} | {status} |\n")
+
+    mean_diff = (sum(diffs) / len(diffs)) if diffs else float("nan")
+
+    report_lines.append("\n")
+    report_lines.append(f"- **Max diff**: {max_diff:.2e} (at step {max_diff_step})\n")
+    report_lines.append(f"- **Mean diff**: {mean_diff:.2e}\n")
+    report_lines.append(f"- **Threshold**: 1e-4\n")
+    report_lines.append("\n")
+    if all_pass:
+        report_lines.append("## Result: **PASS** ✅\n")
+    else:
+        report_lines.append("## Result: **FAIL** ❌\n")
+
+    with open(REPORT_PATH, "w") as f:
+        f.writelines(report_lines)
+    print(f"\nReport written to {REPORT_PATH}")
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"LF losses:      {lf_losses}")
+    print(f"Meg losses:     {meg_losses}")
+    print(f"Diffs:          {[abs(l - m) for l, m in zip(lf_losses, meg_losses)]}")
+    print(f"Max diff:       {max_diff:.2e} at step {max_diff_step}")
+    print(f"Status:         {'PASS' if all_pass else 'FAIL'}")
+    print("=" * 70)
+
+    assert all_pass, f"Max loss diff {max_diff:.2e} exceeds threshold 1e-4"
+    assert max_diff < 1e-4, f"Max loss diff {max_diff:.2e} >= 1e-4"
+
+
+if __name__ == "__main__":
+    main()

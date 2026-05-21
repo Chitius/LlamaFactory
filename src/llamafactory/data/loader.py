@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import os
+import warnings
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import numpy as np
+import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
 from ..extras import logging
@@ -23,6 +25,13 @@ from ..extras.constants import FILEEXT2TYPE
 from ..extras.misc import check_version, has_tokenized_data
 from .converter import align_dataset
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
+from .megatron import (
+    MegatronBlendedDataset,
+    MegatronGPTDataset,
+    MegatronGPTDatasetConfig,
+    MegatronIndexedDataset,
+    parse_blend_list,
+)
 from .parser import get_dataset_list
 from .processor import (
     FeedbackDatasetProcessor,
@@ -87,6 +96,10 @@ def _load_single_dataset(
 
         if any(data_path != FILEEXT2TYPE.get(os.path.splitext(data_file)[-1][1:], None) for data_file in data_files):
             raise ValueError("File types should be identical.")
+    elif dataset_attr.load_from == "megatron":
+        return _load_megatron_single_dataset(dataset_attr, data_args, training_args)
+    elif dataset_attr.load_from == "megatron_list":
+        return _load_megatron_list_dataset(dataset_attr, data_args, training_args)
     else:
         raise NotImplementedError(f"Unknown load type: {dataset_attr.load_from}.")
 
@@ -161,6 +174,90 @@ def _load_single_dataset(
     return align_dataset(dataset, dataset_attr, data_args, training_args)
 
 
+def _load_megatron_single_dataset(
+    dataset_attr: "DatasetAttr",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+) -> "torch.utils.data.Dataset":
+    r"""Load a single Megatron GPT dataset."""
+    seq_length = dataset_attr.megatron_seq_length or data_args.cutoff_len
+    seed = dataset_attr.megatron_shuffle_seed or data_args.megatron_shuffle_seed or training_args.seed
+    data_cache_path = dataset_attr.megatron_data_cache_path or data_args.megatron_data_cache_path
+    num_samples = dataset_attr.num_samples or dataset_attr.megatron_num_samples
+
+    split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
+    indexed_dataset = MegatronIndexedDataset(dataset_attr.megatron_path)
+    config = MegatronGPTDatasetConfig(
+        path_prefix=dataset_attr.megatron_path,
+        seq_length=seq_length,
+        seed=seed,
+        num_samples=num_samples,
+        data_cache_path=data_cache_path,
+        reuse_megatron_cache=data_args.megatron_reuse_cache,
+        split=dataset_attr.split,
+        split_ratios=split_ratios,
+    )
+    dataset = MegatronGPTDataset(config, indexed_dataset)
+
+    if data_args.max_samples is not None:
+        max_samples = min(data_args.max_samples, len(dataset))
+        dataset = torch.utils.data.Subset(dataset, range(max_samples))
+
+    return dataset
+
+
+def _load_megatron_list_dataset(
+    dataset_attr: "DatasetAttr",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+) -> "torch.utils.data.Dataset":
+    r"""Load a Megatron blended dataset from a .list file."""
+    prefixes, weights = parse_blend_list(dataset_attr.megatron_list_path)
+
+    split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
+    datasets = []
+    for prefix in prefixes:
+        indexed_dataset = MegatronIndexedDataset(prefix)
+        config = MegatronGPTDatasetConfig(
+            path_prefix=prefix,
+            seq_length=dataset_attr.megatron_seq_length or data_args.cutoff_len,
+            seed=dataset_attr.megatron_shuffle_seed or data_args.megatron_shuffle_seed or training_args.seed,
+            num_samples=dataset_attr.num_samples or dataset_attr.megatron_num_samples,
+            data_cache_path=dataset_attr.megatron_data_cache_path or data_args.megatron_data_cache_path,
+            reuse_megatron_cache=data_args.megatron_reuse_cache,
+            split=dataset_attr.split,
+            split_ratios=split_ratios,
+        )
+        datasets.append(MegatronGPTDataset(config, indexed_dataset))
+
+    if weights is None:
+        # Exhaustive blending: consume all samples from each dataset
+        weights = [len(ds) for ds in datasets]
+        size = None
+    else:
+        size = dataset_attr.num_samples or dataset_attr.megatron_num_samples
+        if size is None:
+            # Compute maximum safe size to avoid oversampling any dataset
+            weights_array = np.array(weights, dtype=np.float64)
+            weights_array = weights_array / weights_array.sum()
+            size = min(int(len(datasets[i]) / weights_array[i]) for i in range(len(datasets)))
+
+    dataset = MegatronBlendedDataset(
+        datasets=datasets,
+        weights=weights,
+        size=size,
+        data_cache_path=dataset_attr.megatron_data_cache_path or data_args.megatron_data_cache_path,
+        seed=dataset_attr.megatron_shuffle_seed or data_args.megatron_shuffle_seed or training_args.seed,
+        split=dataset_attr.split,
+    )
+
+    if data_args.max_samples is not None:
+        max_samples = min(data_args.max_samples, len(dataset))
+        dataset = torch.utils.data.Subset(dataset, range(max_samples))
+
+    return dataset
+
+
 def _get_merged_dataset(
     dataset_names: list[str] | None,
     model_args: "ModelArguments",
@@ -168,13 +265,17 @@ def _get_merged_dataset(
     training_args: "Seq2SeqTrainingArguments",
     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
     return_dict: bool = False,
+    dataset_attrs: list["DatasetAttr"] | None = None,
 ) -> Union["Dataset", "IterableDataset", dict[str, "Dataset"]] | None:
     r"""Return the merged datasets in the standard format."""
     if dataset_names is None:
         return None
 
+    if dataset_attrs is None:
+        dataset_attrs = get_dataset_list(dataset_names, data_args.dataset_dir)
+
     datasets = {}
-    for dataset_name, dataset_attr in zip(dataset_names, get_dataset_list(dataset_names, data_args.dataset_dir)):
+    for dataset_name, dataset_attr in zip(dataset_names, dataset_attrs):
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
@@ -300,7 +401,16 @@ def get_dataset(
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
-        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage)
+        train_dataset_attrs = get_dataset_list(data_args.dataset, data_args.dataset_dir) if data_args.dataset else []
+        eval_dataset_attrs = get_dataset_list(data_args.eval_dataset, data_args.dataset_dir) if data_args.eval_dataset else []
+
+        is_megatron = any(
+            attr.load_from in ("megatron", "megatron_list") for attr in train_dataset_attrs + eval_dataset_attrs
+        )
+
+        dataset = _get_merged_dataset(
+            data_args.dataset, model_args, data_args, training_args, stage, dataset_attrs=train_dataset_attrs
+        )
         eval_dataset = _get_merged_dataset(
             data_args.eval_dataset,
             model_args,
@@ -308,29 +418,57 @@ def get_dataset(
             training_args,
             stage,
             return_dict=data_args.eval_on_each_dataset,
+            dataset_attrs=eval_dataset_attrs,
         )
 
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
         # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
         train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
 
-        if "train" in train_dict:
-            train_dict["train"] = _get_preprocessed_dataset(
-                train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
-            )
+        if is_megatron:
+            # Megatron data is already tokenized; skip preprocessing entirely
+            if data_args.packing:
+                warnings.warn(
+                    "packing is force-disabled for Megatron datasets because sample_index already handles packing semantics.",
+                    UserWarning,
+                )
+                data_args.packing = False
 
-        for key in eval_dict:
-            eval_dict[key] = _get_preprocessed_dataset(
-                eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
-            )
+            if data_args.streaming:
+                raise ValueError(
+                    "streaming is incompatible with Megatron datasets (bin/idx format requires random access via mmap)."
+                )
 
-        # Combine train and eval dictionaries
-        dataset_dict = DatasetDict({**train_dict, **eval_dict})
+            if data_args.neat_packing:
+                warnings.warn(
+                    "neat_packing is not supported for Megatron datasets and will be ignored.",
+                    UserWarning,
+                )
+                data_args.neat_packing = False
 
-        if data_args.tokenized_path is not None:  # save tokenized dataset to disk
+            dataset_dict = DatasetDict({**train_dict, **eval_dict})
+        else:
+            if "train" in train_dict:
+                train_dict["train"] = _get_preprocessed_dataset(
+                    train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
+                )
+
+            for key in eval_dict:
+                eval_dict[key] = _get_preprocessed_dataset(
+                    eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                )
+
+            # Combine train and eval dictionaries
+            dataset_dict = DatasetDict({**train_dict, **eval_dict})
+
+        if data_args.tokenized_path is not None and not is_megatron:  # save tokenized dataset to disk
             if training_args.should_save:
                 dataset_dict.save_to_disk(data_args.tokenized_path)
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
 
-        return get_dataset_module(dataset_dict)
+        dataset_module = get_dataset_module(dataset_dict)
+        if is_megatron:
+            dataset_module["disable_shuffling"] = True
+
+        return dataset_module

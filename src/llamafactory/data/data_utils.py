@@ -14,7 +14,7 @@
 
 import json
 from enum import StrEnum, unique
-from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import fsspec
 from datasets import DatasetDict, concatenate_datasets, interleave_datasets
@@ -46,6 +46,7 @@ class Role(StrEnum):
 class DatasetModule(TypedDict):
     train_dataset: Optional[Union["Dataset", "IterableDataset"]]
     eval_dataset: Optional[Union["Dataset", "IterableDataset", dict[str, "Dataset"]]]
+    disable_shuffling: NotRequired[bool]
 
 
 def merge_dataset(
