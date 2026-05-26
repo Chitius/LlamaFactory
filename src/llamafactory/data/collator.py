@@ -90,6 +90,70 @@ def _slice_mm_inputs_for_sample(
     return sliced_mm_inputs
 
 
+def _compute_cu_seq_lens_for_document_boundary(
+    document_ids: "torch.Tensor",
+) -> tuple["torch.Tensor", "torch.Tensor", int, int]:
+    r"""Compute cu_seq_lens for FlashAttention varlen path from document_ids.
+
+    Args:
+        document_ids: [batch_size, seq_len] tensor of document segment indices.
+                     Padding positions have value 0.
+
+    Returns:
+        cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
+        cu_seq_lens: [num_segments + 1,] torch.int32 tensor, cumulative sum of segment lengths.
+        max_length: int, maximum segment length across all batches.
+
+    .. note::
+        This function treats every contiguous run of identical ``document_ids``
+        (including ``0`` for padding) as an independent attention segment.
+        This is functionally correct for **trailing padding** (the Megatron path),
+        because padding tokens are isolated in their own segment and cannot
+        attend to / be attended by valid tokens.
+
+        For **left padding** or **padding in the middle of a document**, the
+        padding run is also isolated, which prevents cross-attention between
+        the left-padded region and valid tokens. However, a single original
+        document split by padding will be treated as two separate segments
+        that cannot attend to each other. Callers that need intra-document
+        attention across padding boundaries should unpad the sequence before
+        calling this function.
+    """
+    if document_ids.numel() == 0:
+        device = document_ids.device
+        empty_cu = torch.zeros(1, device=device, dtype=torch.int32)
+        return empty_cu, empty_cu, 0, 0
+
+    batch_size, seq_len = document_ids.shape
+    segment_lengths = []
+    max_length = 0
+
+    for i in range(batch_size):
+        row = document_ids[i]
+        if seq_len == 0:
+            continue
+        diff = row[1:] != row[:-1]
+        change_positions = torch.nonzero(diff, as_tuple=False).flatten() + 1
+        boundaries = [0] + change_positions.tolist() + [seq_len]
+        lengths_list = [boundaries[j + 1] - boundaries[j] for j in range(len(boundaries) - 1)]
+        lengths = torch.tensor(lengths_list, device=document_ids.device, dtype=torch.long)
+        segment_lengths.append(lengths)
+        if lengths.numel() > 0:
+            max_length = max(max_length, int(lengths.max().item()))
+
+    if segment_lengths:
+        all_lengths = torch.cat(segment_lengths)
+    else:
+        all_lengths = torch.zeros(1, device=document_ids.device, dtype=torch.long)
+
+    cu_seq_lens = torch.cat([
+        torch.zeros(1, device=document_ids.device, dtype=torch.int32),
+        torch.cumsum(all_lengths, dim=0).to(torch.int32),
+    ])
+
+    return cu_seq_lens, cu_seq_lens, max_length, max_length
+
+
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
     r"""Expand 2d attention mask to 4d attention mask.
 
@@ -131,6 +195,43 @@ def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype
     # Invert the attention mask.
     attention_mask_4d = torch.where(attention_mask_4d, zero_tensor, min_dtype)
     return attention_mask_4d
+
+
+def apply_document_boundary_mask(
+    features: dict[str, "torch.Tensor"],
+    compute_dtype: "torch.dtype",
+    attn_implementation: Literal["eager", "sdpa", "flash_attention_2", "fa2", "fa3", "disabled"],
+    block_diag_attn: bool = False,
+) -> dict[str, "torch.Tensor"]:
+    r"""Apply document-boundary attention mask to a batch.
+
+    For eager/SDPA: converts document-indexed ``document_ids`` to 4D block-diagonal causal mask.
+    For flash_attention_2/fa2/fa3: computes ``cu_seq_lens`` for FlashAttention varlen path.
+
+    Also casts floating-point tensors to ``compute_dtype`` (e.g. for paligemma).
+    """
+    document_ids = features.pop("document_ids", None)
+    if block_diag_attn and document_ids is not None:
+        if attn_implementation in ("flash_attention_2", "fa2", "fa3"):
+            cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k = (
+                _compute_cu_seq_lens_for_document_boundary(document_ids)
+            )
+            features["attention_mask"] = None
+            features["cu_seq_lens_q"] = cu_seq_lens_q
+            features["cu_seq_lens_k"] = cu_seq_lens_k
+            features["max_length_q"] = max_length_q
+            features["max_length_k"] = max_length_k
+        else:
+            features["attention_mask"] = prepare_4d_attention_mask(
+                document_ids, compute_dtype
+            )
+
+    # cast data dtype for paligemma and other models that require it
+    for key, value in features.items():
+        if torch.is_tensor(value) and torch.is_floating_point(value):
+            features[key] = value.to(compute_dtype)
+
+    return features
 
 
 @dataclass
@@ -482,7 +583,7 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     r"""Data collator for 4d attention mask."""
 
     block_diag_attn: bool = False
-    attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
+    attn_implementation: Literal["eager", "sdpa", "flash_attention_2", "fa2", "fa3"] = "eager"
     compute_dtype: "torch.dtype" = torch.float32
     neat_packing: bool = False
 
@@ -494,13 +595,24 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
 
     @staticmethod
     def _unpad_packed_features(features: dict[str, Any]) -> None:
-        r"""Trim padded positions for packed FA2 batches."""
+        r"""Trim padded positions for packed FA2 batches.
+
+        Falls back to ``document_ids`` when ``attention_mask`` is not a 2D tensor,
+        which happens in the FA2 varlen + document-boundary path where
+        ``attention_mask`` has already been set to ``None``.
+        """
         attention_mask = features.get("attention_mask")
-        if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.size(0) != 1:
+        document_ids = features.get("document_ids")
+
+        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2 and attention_mask.size(0) == 1:
+            seq_len = attention_mask.size(1)
+            non_padding_indices = torch.nonzero(attention_mask[0] != 0, as_tuple=False).flatten()
+        elif torch.is_tensor(document_ids) and document_ids.dim() == 2 and document_ids.size(0) == 1:
+            seq_len = document_ids.size(1)
+            non_padding_indices = torch.nonzero(document_ids[0] != 0, as_tuple=False).flatten()
+        else:
             return
 
-        seq_len = attention_mask.size(1)
-        non_padding_indices = torch.nonzero(attention_mask[0] != 0, as_tuple=False).flatten()
         if non_padding_indices.numel() == seq_len:
             return
 
@@ -517,18 +629,99 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                 features[key] = value.index_select(1, non_padding_indices)
             elif key in keys_on_seq_dim_1 and value.dim() == 2 and value.size(0) == 1 and value.size(1) == seq_len:
                 features[key] = value.index_select(1, non_padding_indices)
+            elif key == "document_ids" and value.dim() == 2 and value.size(0) == 1 and value.size(1) == seq_len:
+                features[key] = value.index_select(1, non_padding_indices)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+        # Extract custom fields before base collator processing (Megatron path)
+        custom_document_ids = None
+        custom_position_ids = None
+        if features and "document_ids" in features[0]:
+            features = [dict(ex) for ex in features]
+            custom_document_ids = [ex.pop("document_ids", None) for ex in features]
+            custom_position_ids = [ex.pop("position_ids", None) for ex in features]
+            # DataCollatorForSeq2Seq does list concatenation on labels;
+            # tensors would cause errors.
+            for ex in features:
+                for key in ("labels", "document_ids", "position_ids"):
+                    if key in ex and torch.is_tensor(ex[key]):
+                        ex[key] = ex[key].tolist()
+
         features = super().__call__(features)
         has_dummy_image = features.pop("has_dummy_image", False)
-        if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
-            features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
 
+        # Restore and pad document_ids
+        if custom_document_ids is not None:
+            max_len = features["input_ids"].size(1)
+            padded_document_ids = []
+            for doc_ids in custom_document_ids:
+                if doc_ids is None:
+                    seq_len = int(features["attention_mask"][len(padded_document_ids)].sum().item())
+                    doc_ids = torch.cat([
+                        torch.ones(seq_len, dtype=torch.long),
+                        torch.zeros(max_len - seq_len, dtype=torch.long),
+                    ])
+                else:
+                    if isinstance(doc_ids, list):
+                        doc_ids = torch.tensor(doc_ids, dtype=torch.long)
+                    pad_len = max_len - doc_ids.size(0)
+                    if pad_len > 0:
+                        if self.tokenizer.padding_side == "right":
+                            doc_ids = torch.cat([doc_ids, torch.zeros(pad_len, dtype=torch.long)])
+                        else:
+                            doc_ids = torch.cat([torch.zeros(pad_len, dtype=torch.long), doc_ids])
+                padded_document_ids.append(doc_ids)
+            features["document_ids"] = torch.stack(padded_document_ids)
+
+        # Restore and pad position_ids
+        if custom_position_ids is not None:
+            max_len = features["input_ids"].size(1)
+            padded_position_ids = []
+            for pid in custom_position_ids:
+                if pid is None:
+                    pid = torch.arange(max_len, dtype=torch.long)
+                else:
+                    if isinstance(pid, list):
+                        pid = torch.tensor(pid, dtype=torch.long)
+                    pad_len = max_len - pid.size(0)
+                    if pad_len > 0:
+                        if self.tokenizer.padding_side == "right":
+                            pid = torch.cat([pid, torch.zeros(pad_len, dtype=torch.long)])
+                        else:
+                            pid = torch.cat([torch.zeros(pad_len, dtype=torch.long), pid])
+                padded_position_ids.append(pid)
+            features["position_ids"] = torch.stack(padded_position_ids)
+
+        # neat_packing unpad must run before we pop document_ids for the
+        # FA2/FA3 varlen path, so that cu_seq_lens is computed from the
+        # already-unpadded (padding-free) document_ids.
         if self.neat_packing and self.attn_implementation == "flash_attention_2":  # FIXME compatibility fa3/fa4
             assert features["input_ids"].shape[0] == 1, "bsz should be 1 for neat packing"
             if not has_dummy_image:
                 self._unpad_packed_features(features)
 
+        # 4D block-diagonal mask (eager/SDPA)
+        if self.block_diag_attn and self.attn_implementation not in ("flash_attention_2", "fa2", "fa3"):
+            document_ids = features.pop("document_ids", None)
+            if document_ids is not None:
+                features["attention_mask"] = prepare_4d_attention_mask(document_ids, self.compute_dtype)
+            else:
+                features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
+
+        # FA2/FA3 varlen support (Megatron path)
+        if self.block_diag_attn and self.attn_implementation in ("flash_attention_2", "fa2", "fa3"):
+            document_ids = features.pop("document_ids", None)
+            if document_ids is not None:
+                cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k = (
+                    _compute_cu_seq_lens_for_document_boundary(document_ids)
+                )
+                features["attention_mask"] = None
+                features["cu_seq_lens_q"] = cu_seq_lens_q
+                features["cu_seq_lens_k"] = cu_seq_lens_k
+                features["max_length_q"] = max_length_q
+                features["max_length_k"] = max_length_k
+
+        if self.neat_packing and self.attn_implementation == "flash_attention_2":
             features["attention_mask"] = None  # let transformers handle causal packed mask.
 
         for key, value in features.items():  # cast data dtype for paligemma

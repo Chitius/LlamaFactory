@@ -1,0 +1,40 @@
+### model
+model_name_or_path: /tmp/test_llama_mca
+trust_remote_code: false
+
+### method
+stage: pt
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: c4_demo_megatron
+template: llama3
+cutoff_len: 128
+overwrite_cache: true
+preprocessing_num_workers: 1
+
+### output
+output_dir: /tmp/mca_pt_doc_boundary_fa2
+logging_steps: 1
+save_steps: 999999
+plot_loss: false
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+max_steps: 1
+lr_scheduler_type: cosine
+warmup_ratio: 0.0
+ddp_timeout: 180000000
+
+### MCA specific
+transformer_impl: local
+flash_attn: fa2
+
+### Document-boundary
+megatron_reset_attention_mask: true
+megatron_reset_position_ids: true
+megatron_eod_mask_loss: true

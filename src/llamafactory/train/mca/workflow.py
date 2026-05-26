@@ -31,7 +31,7 @@ from ...data.parser import get_dataset_list
 from ...data.collator import (
     PairwiseDataCollatorWithPadding,
 )
-from ...extras.constants import IGNORE_INDEX, MCA_SUPPORTED_MODELS
+from ...extras.constants import IGNORE_INDEX, MCA_SUPPORTED_MODELS, AttentionFunction
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.packages import is_mcore_adapter_available
@@ -58,6 +58,52 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+def _resolve_attn_implementation_for_mca(flash_attn: AttentionFunction) -> str:
+    """Map ModelArguments.flash_attn to collator attn_implementation string.
+
+    MCA models use Transformer Engine / Megatron-Core, not transformers flash_attn.
+    For now, we pass through the user's flash_attn preference; the collator will
+    generate PackedSeqParams for fa2/fa3 or 4D mask for eager/sdpa.
+    """
+    if flash_attn == AttentionFunction.FA2:
+        return "flash_attention_2"
+    elif flash_attn == AttentionFunction.FA3:
+        return "fa3"
+    elif flash_attn == AttentionFunction.SDPA:
+        return "sdpa"
+    elif flash_attn == AttentionFunction.DISABLED:
+        return "eager"
+    else:  # AUTO
+        return "eager"
+
+
+def _set_megatron_shift_labels(dataset: Any, shift_labels: bool = True) -> None:
+    """Recursively set shift_labels on MegatronGPTDataset instances."""
+    from ...data.megatron import MegatronGPTDataset
+
+    if isinstance(dataset, MegatronGPTDataset):
+        dataset.config.shift_labels = shift_labels
+    elif isinstance(dataset, torch.utils.data.Subset):
+        _set_megatron_shift_labels(dataset.dataset, shift_labels)
+    elif isinstance(dataset, torch.utils.data.ConcatDataset):
+        for ds in dataset.datasets:
+            _set_megatron_shift_labels(ds, shift_labels)
+    elif hasattr(dataset, "datasets") and not isinstance(dataset, torch.utils.data.ConcatDataset):
+        # MegatronBlendedDataset or similar wrapper
+        for ds in dataset.datasets:
+            _set_megatron_shift_labels(ds, shift_labels)
+    elif hasattr(dataset, "dataset") and not isinstance(dataset, torch.utils.data.Subset):
+        # Generic wrapper (e.g. ConstantLengthDataset, InterleaveDataset)
+        _set_megatron_shift_labels(dataset.dataset, shift_labels)
+    else:
+        # Unrecognized wrapper: warn but do not crash to preserve backward compatibility
+        logger.warning(
+            "_set_megatron_shift_labels: encountered unrecognized dataset wrapper %s. "
+            "If this wrapper contains a MegatronGPTDataset, shift_labels will NOT be set. "
+            "Please check your dataset pipeline." % type(dataset).__name__
+        )
 
 
 def _has_megatron_dataset(data_args: "DataArguments") -> bool:
@@ -192,17 +238,50 @@ def run_pt(
     if not is_megatron:
         data_args.cutoff_len -= 1
 
+    if is_megatron:
+        for key in ("train_dataset", "eval_dataset"):
+            ds = dataset_module.get(key)
+            if ds is not None:
+                if isinstance(ds, dict):
+                    for sub_ds in ds.values():
+                        _set_megatron_shift_labels(sub_ds, True)
+                else:
+                    _set_megatron_shift_labels(ds, True)
+
     if dataset_module.pop("disable_shuffling", False):
         finetuning_args.disable_shuffling = True
 
     _check_model_support(model_args)
     model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        pad_to_multiple_of=8,
-        label_pad_token_id=IGNORE_INDEX,
-    )
-    if not is_megatron:
+
+    if is_megatron:
+        reset_attn = data_args.megatron_reset_attention_mask
+        reset_pos = data_args.megatron_reset_position_ids
+        eod_mask = data_args.megatron_eod_mask_loss
+
+        if reset_attn or reset_pos or eod_mask:
+            from ...data.megatron.collator import MegatronDataCollatorForSeq2Seq
+            attn_impl = _resolve_attn_implementation_for_mca(model_args.flash_attn)
+            data_collator = MegatronDataCollatorForSeq2Seq(
+                tokenizer=tokenizer,
+                pad_to_multiple_of=8,
+                label_pad_token_id=IGNORE_INDEX,
+                block_diag_attn=reset_attn,
+                attn_implementation=attn_impl,
+                compute_dtype=torch.float32,
+            )
+        else:
+            data_collator = DataCollatorForSeq2Seq(
+                tokenizer=tokenizer,
+                pad_to_multiple_of=8,
+                label_pad_token_id=IGNORE_INDEX,
+            )
+    else:
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            pad_to_multiple_of=8,
+            label_pad_token_id=IGNORE_INDEX,
+        )
         data_collator = _data_collator_wrapper(data_collator)
 
     trainer = CustomMcaTrainer(
@@ -257,6 +336,16 @@ def run_sft(
     if not is_megatron:
         data_args.cutoff_len -= 1
 
+    if is_megatron:
+        for key in ("train_dataset", "eval_dataset"):
+            ds = dataset_module.get(key)
+            if ds is not None:
+                if isinstance(ds, dict):
+                    for sub_ds in ds.values():
+                        _set_megatron_shift_labels(sub_ds, True)
+                else:
+                    _set_megatron_shift_labels(ds, True)
+
     if dataset_module.pop("disable_shuffling", False):
         finetuning_args.disable_shuffling = True
 
@@ -268,7 +357,7 @@ def run_sft(
     _freeze_model_parameters(model, finetuning_args)
 
     pad_to_max = training_args.expert_model_parallel_size is not None and training_args.expert_model_parallel_size > 1
-    data_collator = SFTDataCollatorWith4DAttentionMask(
+    collator_kwargs = dict(
         template=template,
         model=collator_model,
         padding="max_length" if pad_to_max else "longest",
@@ -277,6 +366,19 @@ def run_sft(
         label_pad_token_id=IGNORE_INDEX,
         **tokenizer_module,
     )
+    if is_megatron:
+        reset_attn = data_args.megatron_reset_attention_mask
+        reset_pos = data_args.megatron_reset_position_ids
+        eod_mask = data_args.megatron_eod_mask_loss
+        if reset_attn or reset_pos or eod_mask:
+            collator_kwargs["block_diag_attn"] = reset_attn
+            # TODO: SFTDataCollatorWith4DAttentionMask generates transformers-style
+            # cu_seq_lens for FA2/FA3. MCA adapter compatibility with Megatron-style
+            # PackedSeqParams needs further validation.
+            attn_impl = _resolve_attn_implementation_for_mca(model_args.flash_attn)
+            collator_kwargs["attn_implementation"] = attn_impl
+
+    data_collator = SFTDataCollatorWith4DAttentionMask(**collator_kwargs)
     if not is_megatron:
         data_collator = _data_collator_wrapper(data_collator)
 
@@ -331,6 +433,17 @@ def run_dpo(
         ref_model = None
 
     is_megatron = _has_megatron_dataset(data_args)
+
+    if is_megatron:
+        reset_attn = data_args.megatron_reset_attention_mask
+        if reset_attn:
+            logger.warning_rank0(
+                "MCA path does not yet support megatron_reset_attention_mask in Phase 1. "
+                "Document-boundary features are forcibly disabled in MCA mode."
+            )
+            data_args.megatron_reset_attention_mask = False
+            data_args.megatron_reset_position_ids = False
+            data_args.megatron_eod_mask_loss = False
 
     # dataset needs +1 then cut back due to MCA shift logic
     if not is_megatron:

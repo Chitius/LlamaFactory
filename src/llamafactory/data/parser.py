@@ -15,7 +15,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from huggingface_hub import hf_hub_download
 
@@ -45,6 +45,9 @@ class DatasetAttr:
     megatron_num_samples: int | None = None
     megatron_data_cache_path: str | None = None
     megatron_split: str | None = None
+    megatron_reset_attention_mask: Optional[bool] = None
+    megatron_reset_position_ids: Optional[bool] = None
+    megatron_eod_mask_loss: Optional[bool] = None
     # common columns
     system: str | None = None
     tools: str | None = None
@@ -91,6 +94,9 @@ class DatasetAttr:
         self.set_attr("megatron_num_samples", attr)
         self.set_attr("megatron_data_cache_path", attr)
         self.set_attr("megatron_split", attr)
+        self.set_attr("megatron_reset_attention_mask", attr, default=None)
+        self.set_attr("megatron_reset_position_ids", attr, default=None)
+        self.set_attr("megatron_eod_mask_loss", attr, default=None)
 
         if "columns" in attr:
             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]

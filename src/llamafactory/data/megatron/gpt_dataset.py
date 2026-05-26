@@ -25,7 +25,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from math import ceil
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy
 import torch
@@ -80,6 +80,37 @@ class MegatronGPTDatasetConfig:
     pad_token_id: int = -1
     """Token ID used for padding when a sample spans document boundaries
     and is shorter than the required length."""
+
+    reset_attention_mask: bool = False
+    """Whether to reset attention mask at document boundaries.
+    When True, ``__getitem__`` returns an extra ``document_ids`` field."""
+
+    reset_position_ids: bool = False
+    """Whether to reset position ids at document boundaries (restart from 0)."""
+
+    eod_mask_loss: bool = False
+    """Whether to mask EOD token loss (set labels to -100 at EOD positions)."""
+
+    eod_token_id: Optional[int] = None
+    """EOD token ID. Required when ``eod_mask_loss`` is True."""
+
+    shift_labels: bool = False
+    """Whether to shift labels by one position for causal LM training.
+    When False, labels = tokens.clone() (HuggingFace convention, model internally shifts).
+    When True and add_extra_token=True, labels = text[1:] (Megatron convention, model does NOT internally shift).
+    When True and add_extra_token=False, labels = roll(text, -1) with last position masked.
+    """
+
+    def __post_init__(self):
+        if self.reset_attention_mask or self.reset_position_ids or self.eod_mask_loss:
+            if self.pad_token_id < 0:
+                raise ValueError(
+                    f"pad_token_id must be a non-negative integer when "
+                    f"reset_attention_mask, reset_position_ids, or eod_mask_loss is enabled, got {self.pad_token_id}. "
+                    f"Ensure loader.py passes tokenizer.pad_token_id."
+                )
+        if self.eod_mask_loss and self.eod_token_id is None:
+            raise ValueError("eod_token_id must be provided when eod_mask_loss is enabled.")
 
 
 class MegatronGPTDataset(torch.utils.data.Dataset):
@@ -189,27 +220,50 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
         Reference:
             ``megatron/core/datasets/gpt_dataset.py::GPTDataset.__getitem__``
         """
-        text = self._get_text(idx)
+        text, document_ids, position_ids = self._get_sample(idx)
         text = torch.from_numpy(text).long()
+        document_ids = torch.from_numpy(document_ids).long()
+        if position_ids is not None:
+            position_ids = torch.from_numpy(position_ids).long()
 
         if self.config.add_extra_token:
             tokens = text[:-1].contiguous()
-            # labels are NOT shifted here because HF AutoModelForCausalLM
-            # performs the shift internally in its loss computation.
-            # Returning unshifted labels (same as input_ids) ensures correct
-            # causal-LM loss alignment with HF Trainer.
-            labels = tokens.clone()
+            if self.config.shift_labels:
+                labels = text[1:].clone()
+            else:
+                labels = tokens.clone()
         else:
             tokens = text
-            labels = tokens.clone()
+            if self.config.shift_labels:
+                labels = torch.roll(text, shifts=-1, dims=0).clone()
+                labels[-1] = -100  # mask last position since there is no next token
+            else:
+                labels = tokens.clone()
+
+        pad_id = self.config.pad_token_id
+        if pad_id is not None and pad_id >= 0:
+            # Mask based on shifted labels (not input tokens) to align with Megatron loss_mask semantics.
+            # tokens[i] predicts labels[i]; if labels[i] is pad/eod, that prediction should be masked.
+            labels[labels == pad_id] = -100
+
+        if self.config.eod_mask_loss and self.config.eod_token_id is not None:
+            labels[labels == self.config.eod_token_id] = -100
 
         attention_mask = torch.ones(self.config.seq_length, dtype=torch.long)
 
-        return {
+        result = {
             "input_ids": tokens,
             "labels": labels,
             "attention_mask": attention_mask,
         }
+
+        if self.config.reset_attention_mask:
+            result["document_ids"] = document_ids[: self.config.seq_length]
+
+        if position_ids is not None:
+            result["position_ids"] = position_ids[: self.config.seq_length]
+
+        return result
 
     @property
     def document_index(self) -> numpy.ndarray:
@@ -495,11 +549,13 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
     # Sampling
     # ------------------------------------------------------------------
 
-    def _get_text(self, idx: int) -> numpy.ndarray:
-        """Retrieve the raw token ids for sample *idx*.
+    def _get_sample(self, idx: int) -> Tuple[numpy.ndarray, numpy.ndarray, Optional[numpy.ndarray]]:
+        """Retrieve the raw token ids, document ids, and optional position ids for sample *idx*.
 
         This performs the shuffle mapping, looks up the sample index, and
         concatenates tokens from one or more documents, padding if needed.
+        Document ids mark each token with an incrementing segment index
+        (starting from 1; padding positions are 0).
 
         Reference:
             ``megatron/core/datasets/gpt_dataset.py::GPTDataset._query_document_sample_shuffle_indices``
@@ -510,6 +566,8 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
         doc_index_end, doc_index_end_offset = self._sample_index[idx + 1]
 
         sample_parts = []
+        document_ids_parts = []
+        document_id = 1
 
         if doc_index_beg == doc_index_end:
             # Sample spans a single document
@@ -524,6 +582,9 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
                     offset=int(doc_index_beg_offset),
                     length=length,
                 )
+            )
+            document_ids_parts.append(
+                numpy.full(len(sample_parts[-1]), document_id, dtype=numpy.int64)
             )
         else:
             # Sample spans multiple documents
@@ -540,13 +601,40 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
                         length=length,
                     )
                 )
+                document_ids_parts.append(
+                    numpy.full(len(sample_parts[-1]), document_id, dtype=numpy.int64)
+                )
+                document_id += 1
 
         length = sum(map(len, sample_parts))
         target_length = self.config.seq_length + (1 if self.config.add_extra_token else 0)
 
         if length < target_length:
+            pad_length = target_length - length
             sample_parts.append(
-                numpy.full(target_length - length, self.config.pad_token_id, dtype=numpy.int64)
+                numpy.full(pad_length, self.config.pad_token_id, dtype=numpy.int64)
+            )
+            document_ids_parts.append(
+                numpy.zeros(pad_length, dtype=numpy.int64)
             )
 
-        return numpy.concatenate(sample_parts, dtype=numpy.int64)
+        text = numpy.concatenate(sample_parts, dtype=numpy.int64)
+        document_ids = numpy.concatenate(document_ids_parts, dtype=numpy.int64)
+
+        position_ids = None
+        if self.config.reset_position_ids:
+            position_ids = numpy.arange(target_length, dtype=numpy.int64)
+            boundary_indices = numpy.where(numpy.diff(document_ids, prepend=document_ids[0]))[0]
+            for b in boundary_indices:
+                if b > 0 and document_ids[b] != 0:
+                    position_ids[b:] -= position_ids[b]
+
+        return text, document_ids, position_ids
+
+    def _get_text(self, idx: int) -> numpy.ndarray:
+        """Retrieve the raw token ids for sample *idx*.
+
+        Backward-compatible wrapper around :meth:`_get_sample`.
+        """
+        text, _, _ = self._get_sample(idx)
+        return text

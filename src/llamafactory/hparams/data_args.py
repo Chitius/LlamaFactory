@@ -155,6 +155,18 @@ class DataArguments:
         default=42,
         metadata={"help": "Random seed for Megatron dataset shuffling."},
     )
+    megatron_reset_attention_mask: bool = field(
+        default=False,
+        metadata={"help": "Reset attention mask at document boundaries for Megatron datasets."},
+    )
+    megatron_reset_position_ids: bool = field(
+        default=False,
+        metadata={"help": "Reset position IDs at document boundaries for Megatron datasets."},
+    )
+    megatron_eod_mask_loss: bool = field(
+        default=False,
+        metadata={"help": "Mask EOD token loss for Megatron datasets."},
+    )
     megatron_split: str | None = field(
         default=None,
         metadata={

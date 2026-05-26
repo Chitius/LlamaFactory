@@ -18,10 +18,13 @@
 import math
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from transformers import DataCollatorForLanguageModeling, DataCollatorForSeq2Seq
 
 from ...data import get_dataset, get_template_and_fix_tokenizer
 from ...data.megatron import MegatronBlendedDataset, MegatronGPTDataset
+from ...extras.constants import AttentionFunction
+from ...extras.logging import get_logger
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
@@ -44,6 +47,9 @@ def _is_megatron_module(dataset_module: dict) -> bool:
     return False
 
 
+logger = get_logger(__name__)
+
+
 def run_pt(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -57,12 +63,49 @@ def run_pt(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="pt", **tokenizer_module)
     if dataset_module.pop("disable_shuffling", False):
         finetuning_args.disable_shuffling = True
+
+    reset_attn = data_args.megatron_reset_attention_mask
+
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     if _is_megatron_module(dataset_module):
-        # MegatronGPTDataset already returns unshifted labels aligned with
-        # HF AutoModelForCausalLM expectations; use the standard LM collator.
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        reset_attn = data_args.megatron_reset_attention_mask
+        reset_pos = data_args.megatron_reset_position_ids
+        eod_mask = data_args.megatron_eod_mask_loss
+
+        if reset_attn or reset_pos or eod_mask:
+            from llamafactory.data.megatron.collator import MegatronDataCollatorForLanguageModeling
+            # Resolve actual attention implementation: when flash_attn="auto",
+            # transformers may select a different implementation than "auto".
+            # Use the model's actual _attn_implementation to ensure collator
+            # generates the correct mask format (4D for eager/SDPA, cu_seq_lens for FA2/FA3).
+            attn_impl = str(model_args.flash_attn)
+            if attn_impl == "auto":
+                actual_impl = getattr(model.config, "_attn_implementation", None)
+                if actual_impl is not None:
+                    attn_impl = actual_impl
+                else:
+                    attn_impl = "eager"
+
+            # Defensive: if transformers introduces a new attn implementation that
+            # we do not yet handle, fall back to eager with a loud warning.
+            _KNOWN_ATTN_IMPLS = ("eager", "sdpa", "flash_attention_2", "fa2", "fa3", "disabled")
+            if attn_impl not in _KNOWN_ATTN_IMPLS:
+                logger.warning_rank0(
+                    "Unknown attention implementation '%s' for document-boundary mask. "
+                    "Falling back to 'eager'. Supported values: %s" % (attn_impl, _KNOWN_ATTN_IMPLS)
+                )
+                attn_impl = "eager"
+
+            data_collator = MegatronDataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                mlm=False,
+                block_diag_attn=reset_attn,
+                attn_implementation=attn_impl,
+                compute_dtype=model_args.compute_dtype or torch.float32,
+            )
+        else:
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     else:
         data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 

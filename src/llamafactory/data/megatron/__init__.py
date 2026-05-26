@@ -15,6 +15,7 @@
 from .blend_parser import parse_blend_list
 from .blended_dataset import MegatronBlendedDataset
 from .cache_utils import find_megatron_cache, get_cache_paths, load_cached_indices, save_cached_indices
+from .collator import MegatronDataCollatorForLanguageModeling, MegatronDataCollatorForSeq2Seq
 from .gpt_dataset import MegatronGPTDataset, MegatronGPTDatasetConfig
 from .indexed_dataset import MegatronIndexedDataset
 from .sample_idx_builder import build_blending_indices, build_exhaustive_blending_indices, build_sample_idx
@@ -23,6 +24,8 @@ SUPPORTED_MEGATRON_VERSIONS = ("megatron-core >= 0.5.0",)
 
 __all__ = [
     "MegatronBlendedDataset",
+    "MegatronDataCollatorForLanguageModeling",
+    "MegatronDataCollatorForSeq2Seq",
     "MegatronGPTDataset",
     "MegatronGPTDatasetConfig",
     "MegatronIndexedDataset",
