@@ -43,7 +43,7 @@ def temp_dataset_dir():
     """Create a temporary directory containing a dataset_info.json with a megatron entry."""
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_info = {
-            "fineweb_megatron": {
+            "c4_demo_megatron": {
                 "load_from": "megatron",
                 "megatron_path": MEGATRON_PATH,
                 "megatron_seq_length": 128,
@@ -67,7 +67,7 @@ def test_megatron_dataset_uses_sequential_sampler(temp_dataset_dir, tokenizer):
     """Verify that a Megatron dataset disables HF Trainer's RandomSampler via disable_shuffling."""
     # 1. Build minimal args
     data_args = DataArguments(
-        dataset="fineweb_megatron",
+        dataset="c4_demo_megatron",
         dataset_dir=temp_dataset_dir,
         cutoff_len=128,
         megatron_data_cache_path=CACHE_PATH,

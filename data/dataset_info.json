@@ -746,14 +746,8 @@
     },
     "folder": "python"
   },
-  "fineweb_megatron": {
-    "megatron_path": "/home/public/liuyichuan/data/fineweb_edu_50k_ds3_text_document",
-    "megatron_seq_length": 128,
-    "megatron_shuffle_seed": 42,
-    "megatron_data_cache_path": "/tmp/mca_test_cache"
-  },
   "c4_demo_megatron": {
-    "megatron_path": "/home/public/liuyichuan/playground/LlamaFactory/data/c4_demo_text_document",
+    "megatron_path": "data/c4_demo_text_document",
     "megatron_seq_length": 128,
     "megatron_shuffle_seed": 42,
     "megatron_data_cache_path": "/tmp/mca_c4_demo_cache"

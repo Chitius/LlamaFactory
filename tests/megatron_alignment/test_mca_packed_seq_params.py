@@ -12,6 +12,7 @@ environment because mcore_adapter is a dummy package and Megatron compiled modul
 are built for a different Python version.
 """
 
+import os
 import sys
 from unittest.mock import MagicMock
 
@@ -20,7 +21,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 # Ensure llamafactory is importable
-sys.path.insert(0, "/home/public/liuyichuan/playground/LlamaFactory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
 # Mock mcore_adapter before any MCA imports trigger the availability check
 import importlib.util

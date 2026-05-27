@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Verify labels semantics for MCA PT with document-boundary enabled."""
 
+import os
 import sys
-sys.path.insert(0, "/home/public/liuyichuan/playground/LlamaFactory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
 import torch
 from llamafactory.data.megatron.gpt_dataset import MegatronGPTDataset, MegatronGPTDatasetConfig
@@ -17,7 +18,7 @@ print(f"Tokenizer bos_token_id: {tokenizer.bos_token_id}")
 
 # Build dataset with document-boundary enabled
 config = MegatronGPTDatasetConfig(
-    path_prefix="/home/public/liuyichuan/playground/LlamaFactory/data/c4_demo_text_document",
+    path_prefix=os.path.join(os.path.dirname(__file__), "../../data/c4_demo_text_document"),
     seq_length=128,
     seed=42,
     pad_token_id=tokenizer.pad_token_id,
@@ -29,7 +30,7 @@ config = MegatronGPTDatasetConfig(
     add_extra_token=True,
 )
 
-indexed_dataset = MegatronIndexedDataset("/home/public/liuyichuan/playground/LlamaFactory/data/c4_demo_text_document")
+indexed_dataset = MegatronIndexedDataset(os.path.join(os.path.dirname(__file__), "../../data/c4_demo_text_document"))
 dataset = MegatronGPTDataset(config, indexed_dataset)
 
 print(f"Dataset length: {len(dataset)}")

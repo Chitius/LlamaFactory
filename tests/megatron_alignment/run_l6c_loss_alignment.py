@@ -44,7 +44,6 @@ DATA_PREFIX = os.path.join(os.path.dirname(__file__), "../../data/c4_demo_text_d
 CACHE_PATH_LF = "/tmp/l6c_lf_cache"
 CACHE_PATH_MG = "/tmp/l6c_meg_cache"
 REPORT_PATH = "/tmp/lf_megatron_l6c_report.md"
-MASTER_REPORT_PATH = "/home/public/liuyichuan/plans/lf_megatron_attention_mask_e2e_test_report.md"
 SEED = 42
 SEQ_LENGTH = 128
 NUM_SAMPLES = 200
@@ -371,63 +370,6 @@ def run_megatron_side(model: torch.nn.Module, dataset: Any) -> List[float]:
 
 
 # =============================================================================
-# Report helpers
-# =============================================================================
-
-def _append_to_master_report(all_pass: bool, lf_losses: List[float], meg_losses: List[float]) -> None:
-    status = "PASS" if all_pass else "FAIL"
-
-    lines = [
-        "\n---\n\n",
-        "## L6c: 训练 Loss 对齐（开启 Document-Boundary Mask）\n\n",
-        f"### 测试状态: {status}\n\n",
-        "### 配置\n",
-        "- Model: gpt2\n",
-        f"- Steps: {K_STEPS}\n",
-        f"- Batch size: {BATCH_SIZE}\n",
-        f"- Seq length: {SEQ_LENGTH}\n\n",
-        "### 结果摘要\n\n",
-        "| Step | LF Loss | Megatron Loss | Diff | Status |\n",
-        "|------|---------|---------------|------|--------|\n",
-    ]
-
-    max_diff = 0.0
-    max_diff_step = -1
-    for step in range(len(lf_losses)):
-        lf = lf_losses[step]
-        mg = meg_losses[step]
-        if lf is None or mg is None:
-            diff = float("nan")
-            step_status = "N/A"
-        else:
-            diff = abs(lf - mg)
-            step_status = "PASS" if diff < 1e-4 else "FAIL"
-            if diff > max_diff:
-                max_diff = diff
-                max_diff_step = step
-        lines.append(f"| {step:4d} | {lf!s:>9} | {mg!s:>13} | {diff:.2e} | {step_status} |\n")
-
-    lines.append("\n")
-    lines.append("### 结论\n")
-    if all_pass:
-        lines.append(
-            f"- 前 {K_STEPS} 步 loss diff 均小于 1e-4（最大 diff {max_diff:.2e}，"
-            f"出现在 step {max_diff_step}），LF 与 Megatron 在开启 document-boundary mask "
-            f"后训练 loss 完全对齐。\n"
-        )
-    else:
-        lines.append(
-            f"- 最大 diff {max_diff:.2e}（step {max_diff_step}）超过阈值 1e-4，"
-            f"存在不对齐。\n"
-        )
-    lines.append("\n")
-
-    os.makedirs(os.path.dirname(MASTER_REPORT_PATH), exist_ok=True)
-    with open(MASTER_REPORT_PATH, "a") as f:
-        f.writelines(lines)
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -561,12 +503,6 @@ def main():
     with open(REPORT_PATH, "w") as f:
         f.writelines(report_lines)
     print(f"\nReport written to {REPORT_PATH}")
-
-    # ------------------------------------------------------------------
-    # Append to master report
-    # ------------------------------------------------------------------
-    _append_to_master_report(all_pass, lf_losses, meg_losses)
-    print(f"Master report appended to {MASTER_REPORT_PATH}")
 
     # ------------------------------------------------------------------
     # Console summary
