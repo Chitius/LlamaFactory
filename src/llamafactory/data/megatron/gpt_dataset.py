@@ -220,9 +220,10 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
         Reference:
             ``megatron/core/datasets/gpt_dataset.py::GPTDataset.__getitem__``
         """
-        text, document_ids, position_ids = self._get_sample(idx)
+        text, document_ids, position_ids, padding_mask = self._get_sample(idx)
         text = torch.from_numpy(text).long()
         document_ids = torch.from_numpy(document_ids).long()
+        padding_mask = torch.from_numpy(padding_mask)
         if position_ids is not None:
             position_ids = torch.from_numpy(position_ids).long()
 
@@ -230,21 +231,22 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
             tokens = text[:-1].contiguous()
             if self.config.shift_labels:
                 labels = text[1:].clone()
+                labels_pad = padding_mask[1:]  # aligned with text[1:]
             else:
                 labels = tokens.clone()
+                labels_pad = padding_mask[: self.config.seq_length]  # aligned with text[:-1]
         else:
             tokens = text
             if self.config.shift_labels:
                 labels = torch.roll(text, shifts=-1, dims=0).clone()
                 labels[-1] = -100  # mask last position since there is no next token
+                # labels[i] corresponds to text[i+1] for i < seq_length-1
+                labels_pad = torch.cat([padding_mask[1:], torch.tensor([False])])
             else:
                 labels = tokens.clone()
+                labels_pad = padding_mask
 
-        pad_id = self.config.pad_token_id
-        if pad_id is not None and pad_id >= 0:
-            # Mask based on shifted labels (not input tokens) to align with Megatron loss_mask semantics.
-            # tokens[i] predicts labels[i]; if labels[i] is pad/eod, that prediction should be masked.
-            labels[labels == pad_id] = -100
+        labels[labels_pad] = -100
 
         if self.config.eod_mask_loss and self.config.eod_token_id is not None:
             labels[labels == self.config.eod_token_id] = -100
@@ -549,13 +551,15 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
     # Sampling
     # ------------------------------------------------------------------
 
-    def _get_sample(self, idx: int) -> Tuple[numpy.ndarray, numpy.ndarray, Optional[numpy.ndarray]]:
-        """Retrieve the raw token ids, document ids, and optional position ids for sample *idx*.
+    def _get_sample(self, idx: int) -> Tuple[numpy.ndarray, numpy.ndarray, Optional[numpy.ndarray], numpy.ndarray]:
+        """Retrieve the raw token ids, document ids, position ids, and padding mask for sample *idx*.
 
         This performs the shuffle mapping, looks up the sample index, and
         concatenates tokens from one or more documents, padding if needed.
         Document ids mark each token with an incrementing segment index
         (starting from 1; padding positions are 0).
+        The padding mask is ``True`` at positions that were artificially padded
+        and ``False`` for real document tokens.
 
         Reference:
             ``megatron/core/datasets/gpt_dataset.py::GPTDataset._query_document_sample_shuffle_indices``
@@ -609,6 +613,9 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
         length = sum(map(len, sample_parts))
         target_length = self.config.seq_length + (1 if self.config.add_extra_token else 0)
 
+        # Build position-based padding mask: True = artificially padded, False = real data
+        padding_mask_parts = [numpy.zeros(len(p), dtype=bool) for p in sample_parts]
+
         if length < target_length:
             pad_length = target_length - length
             sample_parts.append(
@@ -617,9 +624,13 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
             document_ids_parts.append(
                 numpy.zeros(pad_length, dtype=numpy.int64)
             )
+            padding_mask_parts.append(
+                numpy.ones(pad_length, dtype=bool)
+            )
 
         text = numpy.concatenate(sample_parts, dtype=numpy.int64)
         document_ids = numpy.concatenate(document_ids_parts, dtype=numpy.int64)
+        padding_mask = numpy.concatenate(padding_mask_parts)
 
         position_ids = None
         if self.config.reset_position_ids:
@@ -629,12 +640,12 @@ class MegatronGPTDataset(torch.utils.data.Dataset):
                 if b > 0 and document_ids[b] != 0:
                     position_ids[b:] -= position_ids[b]
 
-        return text, document_ids, position_ids
+        return text, document_ids, position_ids, padding_mask
 
     def _get_text(self, idx: int) -> numpy.ndarray:
         """Retrieve the raw token ids for sample *idx*.
 
         Backward-compatible wrapper around :meth:`_get_sample`.
         """
-        text, _, _ = self._get_sample(idx)
+        text, _, _, _ = self._get_sample(idx)
         return text

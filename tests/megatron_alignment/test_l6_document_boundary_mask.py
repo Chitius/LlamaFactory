@@ -164,7 +164,7 @@ def test_document_ids_generation(dataset_reset_all):
     """Verify _get_sample generates correct document_ids."""
     dataset = dataset_reset_all
     for idx in range(len(dataset)):
-        text, document_ids, _ = dataset._get_sample(idx)
+        text, document_ids, _, padding_mask_np = dataset._get_sample(idx)
         shuffled_idx = int(dataset._shuffle_index[idx])
         doc_beg, off_beg = dataset._sample_index[shuffled_idx]
         doc_end, off_end = dataset._sample_index[shuffled_idx + 1]
@@ -173,16 +173,9 @@ def test_document_ids_generation(dataset_reset_all):
         assert len(text) == expected_text_len, f"text length mismatch at {idx}"
         assert len(document_ids) == len(text), f"document_ids length mismatch at {idx}"
 
-        # Trailing padding positions (if any) have document_id == 0
-        # Note: pad_token_id may coincide with EOD tokens in the raw data,
-        # so we only check the trailing padding added by _get_sample.
-        pad_id = dataset.config.pad_token_id
-        trailing_pad = 0
-        for j in range(len(text) - 1, -1, -1):
-            if text[j] == pad_id:
-                trailing_pad += 1
-            else:
-                break
+        # Use position-based padding mask instead of value comparison to avoid
+        # mis-detecting real EOS tokens as padding when pad_token_id == eos_token_id.
+        trailing_pad = int(padding_mask_np.sum())
         if trailing_pad > 0:
             assert np.all(document_ids[-trailing_pad:] == 0), f"padding document_ids not zero at {idx}"
 
@@ -806,7 +799,7 @@ def test_l6b_batch_level_mask():
     dataset = MegatronGPTDataset(config, mock_ds)
 
     # --- Verify raw sample structure ---
-    text, doc_ids_full, _ = dataset._get_sample(0)
+    text, doc_ids_full, _, _ = dataset._get_sample(0)
     assert len(text) == 5, f"expected text length 5, got {len(text)}"
     assert len(doc_ids_full) == 5, f"expected document_ids length 5, got {len(doc_ids_full)}"
     expected_doc_ids_full = np.array([1, 1, 1, 2, 2], dtype=np.int64)
@@ -1178,7 +1171,7 @@ def test_l6d_padding_scenario():
     assert mask[0, 0, 0, 35] == min_dtype
 
     # --- Megatron alignment (optional): sample 1 non-padding position_ids ---
-    text1_np, doc_ids1_np, pos_ids1_raw = dataset._get_sample(1)
+    text1_np, doc_ids1_np, pos_ids1_raw, _ = dataset._get_sample(1)
     non_pad_mask_np = doc_ids1_np != 0
     non_pad_text = torch.from_numpy(text1_np[non_pad_mask_np]).long()
     _, loss_mask_mg, pos_ids_mg = _get_ltor_masks_and_position_ids(
@@ -1560,17 +1553,17 @@ def test_shift_labels_true():
     checked = False
     for idx in range(len(dataset)):
         item = dataset[idx]
-        text, _, _ = dataset._get_sample(idx)
+        text, _, _, padding_mask_np = dataset._get_sample(idx)
         text_tensor = torch.from_numpy(text).long()
+        padding_mask_t = torch.from_numpy(padding_mask_np)
 
         # input_ids should be text[:-1]
         assert torch.equal(item["input_ids"], text_tensor[:-1]), f"input_ids mismatch at {idx}"
         # labels should be text[1:] (before padding mask)
         raw_labels = text_tensor[1:]
-        # Account for padding mask: padding positions in shifted labels should be -100
-        # This aligns with Megatron loss_mask semantics: mask the prediction of a pad token.
+        # Use position-based padding mask: add_extra_token=True + shift_labels=True → padding_mask[1:]
         expected_labels = raw_labels.clone()
-        expected_labels[expected_labels == config.pad_token_id] = -100
+        expected_labels[padding_mask_t[1:]] = -100
         assert torch.equal(item["labels"], expected_labels), f"labels mismatch at {idx}"
         # For non-padding positions, labels should differ from input_ids (shifted)
         non_pad = item["labels"] != -100
@@ -1624,13 +1617,14 @@ def test_shift_labels_false():
 
     for idx in range(len(dataset)):
         item = dataset[idx]
-        # labels should equal input_ids everywhere except padding positions (which are -100)
-        pad_mask = item["input_ids"] == config.pad_token_id
-        non_pad = ~pad_mask
+        # Use position-based padding mask: add_extra_token=True, shift_labels=False → padding_mask[:seq_length]
+        _, _, _, padding_mask_np = dataset._get_sample(idx)
+        labels_pad = torch.from_numpy(padding_mask_np[: config.seq_length])
+        non_pad = ~labels_pad
         if torch.any(non_pad):
             assert torch.equal(item["labels"][non_pad], item["input_ids"][non_pad]), f"labels should equal input_ids at {idx}"
-        if torch.any(pad_mask):
-            assert torch.all(item["labels"][pad_mask] == -100), f"padding should be masked at {idx}"
+        if torch.any(labels_pad):
+            assert torch.all(item["labels"][labels_pad] == -100), f"padding should be masked at {idx}"
 
     if os.path.isdir(cache_path):
         shutil.rmtree(cache_path)
