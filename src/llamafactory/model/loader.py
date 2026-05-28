@@ -31,6 +31,8 @@ from ..extras import logging
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
+from .model_utils.dsv3_grouped_moe import patch_deepseek_v3_moe
+from .model_utils.dsv2_grouped_moe import patch_deepseek_v2_moe
 from .model_utils.liger_kernel import apply_liger_kernel
 from .model_utils.misc import register_autoclass
 from .model_utils.mod import convert_pretrained_model_to_mod, load_mod_pretrained_model
@@ -180,6 +182,13 @@ def load_model(
     if not lazy_load:
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
+
+    # DSv2 HF-path grouped-GEMM MoE patch (must run after model instantiation).
+    if getattr(finetuning_args, "use_grouped_gemm_moe", False):
+        if getattr(model.config, "model_type", None) == "deepseek_v2":
+            patch_deepseek_v2_moe(model)
+        elif getattr(model.config, "model_type", None) == "deepseek_v3":
+            patch_deepseek_v3_moe(config)
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 

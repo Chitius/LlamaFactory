@@ -1,0 +1,54 @@
+### model
+# Megatron DeepSeek-3B (V3 model type) -> LlamaFactory best-effort mapping.
+model_name_or_path: deepseek-ai/DeepSeek-V3-Base
+config_name_or_path: /public/pangxizheng/LLaMA-Factory/dsv3_megatron_config/deepseek_3bv3_megatron_like_config.json
+trust_remote_code: true
+train_from_scratch: true
+flash_attn: fa2
+moe_aux_loss_coef: 1.0e-4
+disable_gradient_checkpointing: false
+
+### method
+stage: pt
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: remix_olmo3_books_1T
+cutoff_len: 4096
+packing: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: outputs/deepseekv3_moe/pretrain_dsv3_fsdp2
+logging_steps: 1
+save_steps: 100
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: none
+include_num_input_tokens_seen: true
+
+### train
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 16
+learning_rate: 8.6e-4
+lr_scheduler_type: warmup_stable_decay
+lr_scheduler_kwargs:
+  decay_type: cosine
+  num_decay_steps: 12000
+  num_stable_steps: 46000
+  min_lr_ratio: 8.13953488372093e-3
+warmup_steps: 2000
+num_train_epochs: 1.0
+adam_beta1: 0.9
+adam_beta2: 0.95
+weight_decay: 0.1
+max_grad_norm: 1.0
+bf16: true
+fp16: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+use_grouped_gemm_moe: true
+

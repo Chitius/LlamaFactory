@@ -473,6 +473,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to use the Adam-mini optimizer."},
     )
+    use_grouped_gemm_moe: bool = field(
+        default=False,
+        metadata={"help": "Replace HF DeepseekV3MoE for-loop with grouped-GEMM (HF path only)."},
+    )
     use_mca: bool = field(
         default=False,
         metadata={

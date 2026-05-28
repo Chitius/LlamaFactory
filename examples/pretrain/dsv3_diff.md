@@ -122,4 +122,18 @@ source /home/miniconda3/bin/activate llamafactory
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29687 --nproc_per_node=8 src/train.py examples/pretrain/deepseekv3_megatron.yaml
 ```
 
+### 4) Main run config (8-GPU FSDP2 long run)
+
+```bash
+cd /public/wenweihuang/LlamaF-actory
+source /home/miniconda3/bin/activate llamafactory
+pip install grouped_gemm
+
+accelerate launch \
+    --config_file examples/accelerate/fsdp2_config_dsv3.yaml \
+    --main_process_port 29800 \
+    src/train.py \
+    examples/pretrain/deepseekv3_fsdp2.yaml
+```
+
 Fineweb log path: `/public/wenweihuang/Llama-Factory/saves/deepseekv3_moe/`
