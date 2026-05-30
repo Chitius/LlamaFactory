@@ -42,8 +42,16 @@ def parse_blend_list(list_path: str) -> Tuple[List[str], Optional[List[float]]]:
         stripped path strings and *weights* is either a list of ``float``
         values or ``None``.
     """
+    tokens: List[str] = []
     with open(list_path, "r", encoding="utf-8") as f:
-        tokens = f.read().split()
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line_tokens = line.split()
+            if "#" in line_tokens:
+                line_tokens = line_tokens[: line_tokens.index("#")]
+            tokens.extend(line_tokens)
 
     if not tokens:
         return [], None
