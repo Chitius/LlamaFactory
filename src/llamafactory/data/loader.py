@@ -194,7 +194,7 @@ def _load_megatron_single_dataset(
     seq_length = dataset_attr.megatron_seq_length or data_args.cutoff_len
     seed = dataset_attr.megatron_shuffle_seed or data_args.megatron_shuffle_seed or training_args.seed
     data_cache_path = dataset_attr.megatron_data_cache_path or data_args.megatron_data_cache_path
-    num_samples = dataset_attr.num_samples or dataset_attr.megatron_num_samples
+    num_samples = dataset_attr.num_samples if dataset_attr.num_samples is not None else dataset_attr.megatron_num_samples
 
     split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
     megatron_path = os.path.join(data_args.dataset_dir, dataset_attr.megatron_path)
@@ -239,6 +239,11 @@ def _load_megatron_list_dataset(
     r"""Load a Megatron blended dataset from a .list file."""
     list_path = os.path.join(data_args.dataset_dir, dataset_attr.megatron_list_path)
     prefixes, weights = parse_blend_list(list_path)
+    if not prefixes:
+        raise ValueError(
+            f"No valid dataset prefixes found in {dataset_attr.megatron_list_path}. "
+            "Ensure the .list file is not empty and does not contain only comments."
+        )
 
     split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
 
@@ -259,7 +264,7 @@ def _load_megatron_list_dataset(
             path_prefix=prefix,
             seq_length=dataset_attr.megatron_seq_length or data_args.cutoff_len,
             seed=dataset_attr.megatron_shuffle_seed or data_args.megatron_shuffle_seed or training_args.seed,
-            num_samples=dataset_attr.num_samples or dataset_attr.megatron_num_samples,
+            num_samples=dataset_attr.num_samples if dataset_attr.num_samples is not None else dataset_attr.megatron_num_samples,
             data_cache_path=dataset_attr.megatron_data_cache_path or data_args.megatron_data_cache_path,
             reuse_megatron_cache=data_args.megatron_reuse_cache,
             split=dataset_attr.split,
@@ -277,7 +282,7 @@ def _load_megatron_list_dataset(
         weights = [len(ds) for ds in datasets]
         size = None
     else:
-        size = dataset_attr.num_samples or dataset_attr.megatron_num_samples
+        size = dataset_attr.num_samples if dataset_attr.num_samples is not None else dataset_attr.megatron_num_samples
         if size is None:
             # Compute maximum safe size to avoid oversampling any dataset
             weights_array = np.array(weights, dtype=np.float64)
