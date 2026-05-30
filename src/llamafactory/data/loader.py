@@ -197,7 +197,8 @@ def _load_megatron_single_dataset(
     num_samples = dataset_attr.num_samples or dataset_attr.megatron_num_samples
 
     split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
-    indexed_dataset = MegatronIndexedDataset(dataset_attr.megatron_path)
+    megatron_path = os.path.join(data_args.dataset_dir, dataset_attr.megatron_path)
+    indexed_dataset = MegatronIndexedDataset(megatron_path)
 
     pad_token_id = 0
     eod_token_id = None
@@ -206,7 +207,7 @@ def _load_megatron_single_dataset(
         eod_token_id = tokenizer.eos_token_id
 
     config = MegatronGPTDatasetConfig(
-        path_prefix=dataset_attr.megatron_path,
+        path_prefix=megatron_path,
         seq_length=seq_length,
         seed=seed,
         num_samples=num_samples,
@@ -236,7 +237,8 @@ def _load_megatron_list_dataset(
     tokenizer: Optional["PreTrainedTokenizer"] = None,
 ) -> "torch.utils.data.Dataset":
     r"""Load a Megatron blended dataset from a .list file."""
-    prefixes, weights = parse_blend_list(dataset_attr.megatron_list_path)
+    list_path = os.path.join(data_args.dataset_dir, dataset_attr.megatron_list_path)
+    prefixes, weights = parse_blend_list(list_path)
 
     split_ratios = dataset_attr.megatron_split or data_args.megatron_split or "1,0,0"
 
