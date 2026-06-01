@@ -101,7 +101,7 @@ Local architecture config:
 ### 1) Debug smoke test (recommended first)
 
 ```bash
-cd /public/wangyiding/LlamaFactory
+cd /public/wenweihuang/Llama-Factory
 source /home/miniconda3/bin/activate llamafactory
 CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29667 --nproc_per_node=1 src/train.py examples/pretrain/deepseekv3_megatron_debug.yaml
 ```
@@ -109,17 +109,17 @@ CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29667 --nproc_per_node=1 src/train
 ### 2) Multi-GPU debug test (GPUs 4-7)
 
 ```bash
-cd /public/wangyiding/LlamaFactory
+cd /public/wenweihuang/Llama-Factory
 source /home/miniconda3/bin/activate llamafactory
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --master_port=29677 --nproc_per_node=4 src/train.py examples/pretrain/deepseekv3_megatron_debug.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29677 --nproc_per_node=8 src/train.py examples/pretrain/deepseekv3_megatron_debug.yaml
 ```
 
 ### 3) Main run config (long run)
 
 ```bash
-cd /public/wangyiding/LlamaFactory
+cd /public/wenweihuang/LlamaF-actory
 source /home/miniconda3/bin/activate llamafactory
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29687 --nproc_per_node=8 src/train.py examples/pretrain/deepseekv3_megatron.yaml
 ```
 
-Fineweb log path: `/public/wangyiding/LlamaFactory/saves/deepseekv3_moe/full/logs/pretrain_epoch1_20260529_171340.log`
+Fineweb log path: `/public/wenweihuang/Llama-Factory/saves/deepseekv3_moe/`
