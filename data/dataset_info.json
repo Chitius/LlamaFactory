@@ -752,6 +752,10 @@
     "megatron_shuffle_seed": 42,
     "megatron_data_cache_path": "/tmp/mca_c4_demo_cache"
   },
+  "remix_olmo3_books_1T": {
+    "megatron_list_path": "/public/wenweihuang/LLaMA-Factory/tmp/stack_train.list",
+    "megatron_data_cache_path": "/tmp/stack_train_cache"
+  },
   "synthetic_short_doc_megatron": {
     "megatron_path": "data/synthetic_short_doc_text_document",
     "megatron_seq_length": 64,
