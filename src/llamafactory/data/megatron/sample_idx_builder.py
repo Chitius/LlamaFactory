@@ -21,6 +21,8 @@ Reference: megatron/core/datasets/helpers.cpp
 from math import ceil
 from typing import Tuple
 
+import warnings
+
 import numpy
 
 
@@ -126,6 +128,22 @@ def build_blending_indices(
         size: Total number of blended samples.
         verbose: Whether to print info.
     """
+    # Prefer Megatron C++ helpers for large-scale datasets
+    try:
+        from megatron.core.datasets import helpers
+        helpers.build_blending_indices(
+            dataset_index, dataset_sample_index, weights, num_datasets, size, verbose
+        )
+        return
+    except Exception:
+        warnings.warn(
+            "Failed to import Megatron C++ helpers. Falling back to pure-Python blending index builder, "
+            "which may be significantly slower for large-scale datasets.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # Pure-Python fallback (slow for large datasets)
     current_samples = numpy.zeros(num_datasets, dtype=numpy.int64)
 
     for sample_idx in range(size):
@@ -166,6 +184,22 @@ def build_exhaustive_blending_indices(
         sizes: Array of exact sample counts per dataset.
         num_datasets: Number of datasets.
     """
+    # Prefer Megatron C++ helpers for large-scale datasets
+    try:
+        from megatron.core.datasets import helpers
+        helpers.build_exhaustive_blending_indices(
+            dataset_index, dataset_sample_index, sizes, num_datasets
+        )
+        return
+    except Exception:
+        warnings.warn(
+            "Failed to import Megatron C++ helpers. Falling back to pure-Python exhaustive blending index builder, "
+            "which may be significantly slower for large-scale datasets.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # Pure-Python fallback (slow for large datasets)
     total_size = int(sizes.sum())
     weights = sizes.astype(numpy.float64) / float(total_size)
     dataset_sample_counts = numpy.zeros(num_datasets, dtype=numpy.int64)
