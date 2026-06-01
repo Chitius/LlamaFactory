@@ -200,6 +200,27 @@ class MegatronDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
             self.block_diag_attn,
         )
 
+        # 7. FA2/FA3 varlen: flatten batch to (1, total_tokens) so that
+        #    flash_attn_varlen_func receives query/key/value in the expected
+        #    (total_tokens, nheads, head_dim) layout.  cu_seq_lens_q/k from
+        #    step 6 already partitions the full batch — they are unchanged.
+        #
+        #    After flattening, label positions that were "first token" of
+        #    samples 1..bsz-1 in the 2D layout become prediction targets of
+        #    the preceding sample's last logit.  These cross-sample boundary
+        #    predictions have no counterpart in the 2D path and would dilute
+        #    the loss.  We mask them to -100.
+        if self.block_diag_attn and self.attn_implementation in ("flash_attention_2", "fa2", "fa3"):
+            bsz = batch["input_ids"].shape[0]
+            seq_len = batch["input_ids"].shape[1]
+            for key in ("input_ids", "labels", "position_ids"):
+                if key in batch and batch[key] is not None and isinstance(batch[key], torch.Tensor):
+                    if batch[key].dim() == 2:
+                        batch[key] = batch[key].view(1, -1)
+            if bsz > 1 and "labels" in batch and batch["labels"] is not None:
+                for k in range(1, bsz):
+                    batch["labels"][0, k * seq_len] = -100
+
         return batch
 
 
