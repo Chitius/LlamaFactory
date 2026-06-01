@@ -106,7 +106,7 @@ source /home/miniconda3/bin/activate llamafactory
 CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29667 --nproc_per_node=1 src/train.py examples/pretrain/deepseekv3_megatron_debug.yaml
 ```
 
-### 2) Multi-GPU debug test (GPUs 4-7)
+### 2) Multi-GPU debug test (GPUs)
 
 ```bash
 cd /public/wenweihuang/Llama-Factory
