@@ -41,6 +41,15 @@ class BaseModelArguments:
             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
         },
     )
+    config_name_or_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to model config (config.json) or identifier used for loading model architecture. "
+                "If unset, falls back to model_name_or_path."
+            )
+        },
+    )
     adapter_name_or_path: str | None = field(
         default=None,
         metadata={
