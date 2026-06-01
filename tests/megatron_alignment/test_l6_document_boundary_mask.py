@@ -1666,3 +1666,301 @@ def test_mca_collator_with_shifted_labels():
     # input_ids should remain unchanged
     assert batch["input_ids"][0].tolist() == [1, 2, 3, 4]
     assert batch["input_ids"][1].tolist() == [10, 11, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: FA2/FA3 varlen flatten tests
+# ---------------------------------------------------------------------------
+
+
+def test_collator_flattens_for_fa2_varlen():
+    """L1: collator flattens (bsz, seq_len) -> (1, total_tokens) for FA2 varlen."""
+    from llamafactory.data.megatron.collator import MegatronDataCollatorForLanguageModeling
+
+    tokenizer = _FakeTokenizer()
+    collator = MegatronDataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+        block_diag_attn=True,
+        attn_implementation="fa2",
+        compute_dtype=torch.float32,
+    )
+
+    examples = [
+        {
+            "input_ids": [1, 2, 3, 4],
+            "labels": [1, 2, 3, 4],
+            "attention_mask": [1, 1, 1, 1],
+            "document_ids": [1, 1, 2, 2],
+            "position_ids": [0, 1, 0, 1],
+        },
+        {
+            "input_ids": [5, 6],
+            "labels": [5, 6],
+            "attention_mask": [1, 1],
+            "document_ids": [1, 1],
+            "position_ids": [0, 1],
+        },
+    ]
+
+    batch = collator(examples)
+
+    # After flatten: batch becomes (1, total_padded_tokens) = (1, max_len*bsz) = (1, 8)
+    total = 4 * 2  # max_len=4, bsz=2 → 8
+    assert batch["input_ids"].shape == (1, total), f"expected (1, {total}), got {batch['input_ids'].shape}"
+    assert batch["labels"].shape == (1, total), f"expected (1, {total}), got {batch['labels'].shape}"
+    assert batch["position_ids"].shape == (1, total), f"expected (1, {total}), got {batch['position_ids'].shape}"
+
+    # cu_seq_lens sum must equal total_tokens in the flattened batch
+    assert "cu_seq_lens_q" in batch
+    assert batch["cu_seq_lens_q"][-1].item() == total, (
+        f"cu_seq_lens_q sum ({batch['cu_seq_lens_q'][-1].item()}) != total_tokens ({total})"
+    )
+
+    # attention_mask is None (FA2 varlen path)
+    assert batch["attention_mask"] is None
+
+    # Content check: flattened input_ids
+    # sample0 padded to max_len=4: [1,2,3,4]; sample1: [5,6,0,0]
+    flat_ids = batch["input_ids"]
+    assert flat_ids[0, 0].item() == 1
+    assert flat_ids[0, 4].item() == 5  # start of sample 1
+    assert flat_ids[0, -1].item() == 0  # trailing pad
+
+    # Sample-boundary labels are masked to -100 so that cross-sample
+    # predictions (logit of sample0's last token → sample1's first label)
+    # do not affect the loss.  Position 0 is dropped by HF's internal shift
+    # regardless; position seq_len is the first label of sample 1.
+    assert batch["labels"][0, 0].item() != -100, "sample0 first label is a real token (HF shift drops position 0 logit)"
+    assert batch["labels"][0, 4].item() == -100, "sample1 first label should be masked (cross-sample boundary)"
+
+
+def test_collator_does_not_flatten_for_eager():
+    """L1: collator does NOT flatten for eager/SDPA (uses 4D mask)."""
+    from llamafactory.data.megatron.collator import MegatronDataCollatorForLanguageModeling
+
+    tokenizer = _FakeTokenizer()
+    collator = MegatronDataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+        block_diag_attn=True,
+        attn_implementation="eager",
+        compute_dtype=torch.float32,
+    )
+
+    examples = [
+        {
+            "input_ids": [1, 2, 3, 4],
+            "labels": [1, 2, 3, 4],
+            "attention_mask": [1, 1, 1, 1],
+            "document_ids": [1, 1, 2, 2],
+            "position_ids": [0, 1, 0, 1],
+        },
+        {
+            "input_ids": [5, 6],
+            "labels": [5, 6],
+            "attention_mask": [1, 1],
+            "document_ids": [1, 1],
+            "position_ids": [0, 1],
+        },
+    ]
+
+    batch = collator(examples)
+
+    # Eager path keeps 2D batch shape
+    assert batch["input_ids"].dim() == 2, f"expected 2D, got {batch['input_ids'].dim()}D"
+    assert batch["input_ids"].shape[0] == 2, f"batch_size should be 2, got {batch['input_ids'].shape[0]}"
+    assert batch["attention_mask"].dim() == 4, "eager should produce 4D mask"
+    assert "cu_seq_lens_q" not in batch
+
+
+def test_collator_flattens_for_fa3_varlen():
+    """L1: collator flattens for FA3 same as FA2."""
+    from llamafactory.data.megatron.collator import MegatronDataCollatorForLanguageModeling
+
+    tokenizer = _FakeTokenizer()
+    collator = MegatronDataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+        block_diag_attn=True,
+        attn_implementation="fa3",
+        compute_dtype=torch.float32,
+    )
+
+    examples = [
+        {
+            "input_ids": [1, 2, 3, 4],
+            "labels": [1, 2, 3, 4],
+            "attention_mask": [1, 1, 1, 1],
+            "document_ids": [1, 1, 2, 2],
+            "position_ids": [0, 1, 0, 1],
+        },
+        {
+            "input_ids": [5, 6],
+            "labels": [5, 6],
+            "attention_mask": [1, 1],
+            "document_ids": [1, 1],
+            "position_ids": [0, 1],
+        },
+    ]
+
+    batch = collator(examples)
+
+    total = 4 * 2  # max_len=4, bsz=2 → 8
+    assert batch["input_ids"].shape == (1, total)
+    assert batch["labels"].shape == (1, total)
+    assert "cu_seq_lens_q" in batch
+    assert batch["attention_mask"] is None
+
+
+def test_collator_no_flatten_when_block_diag_disabled():
+    """L1: collator does NOT flatten when block_diag_attn=False even with FA2."""
+    from llamafactory.data.megatron.collator import MegatronDataCollatorForLanguageModeling
+
+    tokenizer = _FakeTokenizer()
+    collator = MegatronDataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+        block_diag_attn=False,
+        attn_implementation="fa2",
+        compute_dtype=torch.float32,
+    )
+
+    examples = [
+        {"input_ids": [1, 2, 3, 4], "labels": [1, 2, 3, 4], "attention_mask": [1, 1, 1, 1]},
+        {"input_ids": [5, 6], "labels": [5, 6], "attention_mask": [1, 1]},
+    ]
+
+    batch = collator(examples)
+    assert batch["input_ids"].dim() == 2
+    assert batch["input_ids"].shape[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Mask equivalence — cu_seq_lens vs 4D mask
+# ---------------------------------------------------------------------------
+
+
+def _build_equivalent_4d_mask_from_cu_seq_lens(
+    cu_seq_lens: torch.Tensor, total_tokens: int, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Reconstruct a 4D attention mask from cu_seq_lens for equivalence testing.
+
+    Each segment in cu_seq_lens is treated as an independent causal block:
+    - tokens within the same segment can attend to each other causally
+    - tokens in different segments cannot attend to each other at all
+
+    Returns (1, 1, total_tokens, total_tokens) mask with 0.0 = allowed, min_dtype = masked.
+    """
+    min_dtype = torch.finfo(dtype).min
+    segments = cu_seq_lens.tolist()
+
+    # Build a per-token segment id array
+    token_seg = torch.zeros(total_tokens, dtype=torch.long)
+    for i in range(len(segments) - 1):
+        token_seg[segments[i]:segments[i + 1]] = i
+
+    # Build 4D mask: allowed if same_segment AND causal
+    seg_eq = token_seg.unsqueeze(1) == token_seg.unsqueeze(0)  # [T, T]
+    causal = torch.tril(torch.ones(total_tokens, total_tokens, dtype=torch.bool))
+    allowed = seg_eq & causal
+
+    mask_4d = torch.where(allowed, torch.tensor(0.0, dtype=dtype), min_dtype)
+    return mask_4d.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
+
+def test_cu_seq_lens_mask_equivalent_to_4d_mask():
+    """L2: cu_seq_lens-derived attention blocks == 4D mask on non-padding rows.
+
+    Verify that for every non-padding query position the attention pattern
+    derived from cu_seq_lens is pixel-identical to the 4D block-diagonal mask.
+
+    We compare per-sample (not on the flattened full batch) because the 4D
+    mask is built per-sample via prepare_4d_attention_mask.
+    """
+    batch_doc_ids = torch.tensor([[1, 1, 1, 2, 2, 0, 0], [1, 1, 1, 1, 2, 0, 0]])
+    bsz, seq_len = batch_doc_ids.shape
+
+    # Ground truth: per-sample 4D mask
+    mask_4d = prepare_4d_attention_mask(batch_doc_ids, dtype=torch.float32)
+
+    # Compute cu_seq_lens for the full batch
+    cu_seq, _, _, _ = _compute_cu_seq_lens_for_document_boundary(batch_doc_ids)
+
+    # Walk cu_seq_lens to assign per-sample segment boundaries
+    offset = 0
+    for b in range(bsz):
+        # Gather segment boundaries that fall within this sample
+        seg_starts = []
+        for s in range(len(cu_seq) - 1):
+            start = int(cu_seq[s])
+            end = int(cu_seq[s + 1])
+            # If this segment overlaps with sample b
+            if end > offset and start < offset + seq_len:
+                seg_starts.append(max(start, offset) - offset)
+        seg_starts.append(seq_len)  # end boundary
+
+        # Build per-sample mask from these segment boundaries
+        token_seg = torch.zeros(seq_len, dtype=torch.long)
+        for i in range(len(seg_starts) - 1):
+            token_seg[seg_starts[i]:seg_starts[i + 1]] = i
+
+        seg_eq = token_seg.unsqueeze(1) == token_seg.unsqueeze(0)
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+        allowed = seg_eq & causal
+
+        min_dtype = torch.finfo(torch.float32).min
+        mask_cu = torch.where(
+            allowed, torch.tensor(0.0, dtype=torch.float32), min_dtype
+        ).unsqueeze(0).unsqueeze(0)  # (1, 1, s, s)
+
+        # Compare on non-padding query rows only.
+        # Padding tokens (doc_id=0) have their labels set to -100, so the
+        # attention pattern for padding query rows does not affect training.
+        non_pad_rows = (batch_doc_ids[b] != 0)  # (s,)
+        ma = mask_4d[b:b + 1, :, non_pad_rows, :]
+        mb = mask_cu[:, :, non_pad_rows, :]
+        mismatches = (ma != mb).sum().item()
+
+        assert mismatches == 0, f"sample {b}: {mismatches} mismatches on non-padding rows"
+
+        offset += seq_len
+
+
+def test_cu_seq_lens_doc_boundary_causality():
+    """L2: Verify cu_seq_lens correctly partitions documents across batch.
+
+    For document_ids:
+      sample0: doc1(positions 0,1,2), doc2(3,4), pad(5,6)
+      sample1: doc1(positions 0,1,2,3), doc2(4), pad(5,6)
+
+    Expected segments in flattened view:
+      seg0: [0:3]   doc1 of sample0
+      seg1: [3:5]   doc2 of sample0
+      seg2: [5:7]   pad of sample0
+      seg3: [7:11]  doc1 of sample1
+      seg4: [11:12] doc2 of sample1
+      seg5: [12:14] pad of sample1
+
+    Cross-document pairs (e.g. seg0 token → seg1 token) must be BLOCKED.
+    """
+    document_ids = torch.tensor([[1, 1, 1, 2, 2, 0, 0], [1, 1, 1, 1, 2, 0, 0]])
+    cu_seq, _, _, _ = _compute_cu_seq_lens_for_document_boundary(document_ids)
+
+    expected_cu = torch.tensor([0, 3, 5, 7, 11, 12, 14], dtype=torch.int32)
+    assert torch.equal(cu_seq, expected_cu), f"expected cu_seq_lens {expected_cu.tolist()}, got {cu_seq.tolist()}"
+
+    total = 14
+    mask = _build_equivalent_4d_mask_from_cu_seq_lens(cu_seq, total)
+    min_dtype = torch.finfo(torch.float32).min
+
+    # Cross-document: seg0[0] → seg1[3] is blocked
+    assert mask[0, 0, 0, 3] == min_dtype, "token 0 should NOT attend to token 3 (cross-document)"
+    # Cross-padding: seg0[0] → seg2[5] is blocked
+    assert mask[0, 0, 0, 5] == min_dtype, "token 0 should NOT attend to padding token 5"
+    # Within-document causal: seg0[2] → seg0[0] is allowed
+    assert mask[0, 0, 2, 0] == 0.0, "token 2 should attend to token 0 (same doc, causal)"
+    # Within-document future blocked: seg0[0] → seg0[2] is blocked (causal)
+    assert mask[0, 0, 0, 2] == min_dtype, "token 0 should NOT attend to token 2 (future)"
+    # Cross-sample boundary: seg3[7] → seg2[5] is blocked
+    assert mask[0, 0, 7, 5] == min_dtype, "sample1 token 7 should NOT attend to sample0 pad token 5"
