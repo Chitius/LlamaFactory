@@ -151,6 +151,18 @@ class BaseModelArguments:
         default=None,
         metadata={"help": "Coefficient of the auxiliary router loss in mixture-of-experts model."},
     )
+    enable_mtp: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to enable DeepSeek-V3 multi-token prediction training."},
+    )
+    num_nextn_predict_layers: int | None = field(
+        default=None,
+        metadata={"help": "Number of DeepSeek-V3 MTP modules used for next-n-token prediction."},
+    )
+    mtp_loss_weight: float | None = field(
+        default=None,
+        metadata={"help": "Loss weight for the DeepSeek-V3 MTP objective."},
+    )
     disable_gradient_checkpointing: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable gradient checkpointing."},

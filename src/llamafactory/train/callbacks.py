@@ -276,7 +276,13 @@ class LogCallback(TrainerCallback):
             current_steps=self.cur_steps,
             total_steps=self.max_steps,
             loss=state.log_history[-1].get("loss"),
+            main_loss=state.log_history[-1].get("main_loss"),
+            mtp_loss=state.log_history[-1].get("mtp_loss"),
+            mtp_acc=state.log_history[-1].get("mtp_acc"),
             eval_loss=state.log_history[-1].get("eval_loss"),
+            eval_main_loss=state.log_history[-1].get("eval_main_loss"),
+            eval_mtp_loss=state.log_history[-1].get("eval_mtp_loss"),
+            eval_mtp_acc=state.log_history[-1].get("eval_mtp_acc"),
             predict_loss=state.log_history[-1].get("predict_loss"),
             reward=state.log_history[-1].get("reward"),
             accuracy=state.log_history[-1].get("rewards/accuracies"),
@@ -298,7 +304,7 @@ class LogCallback(TrainerCallback):
         logs = {k: v for k, v in logs.items() if v is not None}
         if self.webui_mode and all(key in logs for key in ("loss", "lr", "epoch")):
             log_str = f"'loss': {logs['loss']:.4f}, 'learning_rate': {logs['lr']:2.4e}, 'epoch': {logs['epoch']:.2f}"
-            for extra_key in ("reward", "accuracy", "throughput"):
+            for extra_key in ("main_loss", "mtp_loss", "mtp_acc", "reward", "accuracy", "throughput"):
                 if logs.get(extra_key):
                     log_str += f", '{extra_key}': {logs[extra_key]:.2f}"
 

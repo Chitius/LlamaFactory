@@ -119,7 +119,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29677 --nproc_per_no
 ```bash
 cd /public/wenweihuang/LlamaF-actory
 source /home/miniconda3/bin/activate llamafactory
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29687 --nproc_per_node=8 src/train.py examples/pretrain/deepseekv3_megatron.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_port=29687 --nproc_per_node=8 src/train.py examples/pretrain/deepseekv3_deepspeed.yaml
 ```
 
 ### 4) Main run config (8-GPU FSDP2 long run)

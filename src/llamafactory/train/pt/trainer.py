@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from types import MethodType
 from typing import TYPE_CHECKING, Optional
 
@@ -55,6 +56,7 @@ class CustomTrainer(Trainer):
             self.model_accepts_loss_kwargs = False
 
         self.finetuning_args = finetuning_args
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
@@ -90,4 +92,79 @@ class CustomTrainer(Trainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        loss = super().compute_loss(model, inputs, *args, **kwargs)
+        self._store_mtp_metrics(model, num_items_in_batch=kwargs.get("num_items_in_batch"))
+        return loss
+
+    def _get_metric_model(self, model):
+        if hasattr(self, "accelerator"):
+            try:
+                model = self.accelerator.unwrap_model(model)
+            except Exception:
+                pass
+
+        while hasattr(model, "module"):
+            model = model.module
+
+        return model
+
+    def _get_loss_log_scale(self, num_items_in_batch: Optional["torch.Tensor"] = None) -> float:
+        if not self.model_accepts_loss_kwargs or num_items_in_batch is None:
+            return 1.0
+
+        scale = float(getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps))
+        if self.args.average_tokens_across_devices:
+            scale *= float(self.accelerator.num_processes if self.args.n_gpu <= 1 else self.args.n_gpu)
+
+        return scale
+
+    def _store_mtp_metrics(self, model, num_items_in_batch: Optional["torch.Tensor"] = None) -> None:
+        metric_model = self._get_metric_model(model)
+        if getattr(metric_model, "last_main_loss", None) is None:
+            return
+
+        split = "train" if metric_model.training else "eval"
+        loss_log_scale = self._get_loss_log_scale(num_items_in_batch)
+        self._stored_metrics[split]["main_loss"].append(metric_model.last_main_loss.float().item() * loss_log_scale)
+        self._stored_metrics[split]["mtp_loss"].append(metric_model.last_mtp_loss.float().item() * loss_log_scale)
+
+        mtp_correct = getattr(metric_model, "last_mtp_correct", None)
+        mtp_total = getattr(metric_model, "last_mtp_total", None)
+        if mtp_correct is not None and mtp_total is not None:
+            self._stored_metrics[split]["mtp_correct"].append(mtp_correct.float().item())
+            self._stored_metrics[split]["mtp_total"].append(mtp_total.float().item())
+
+    @override
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        r"""Add MTP metrics collected during compute_loss to Trainer logs."""
+        split = "train" if "loss" in logs else "eval"
+        prefix = "" if split == "train" else "eval_"
+        stored_metrics = self._stored_metrics[split]
+
+        metric_values = []
+        metric_keys = []
+        for key in ("main_loss", "mtp_loss"):
+            values = stored_metrics.get(key, [])
+            if values:
+                metric_keys.append(f"{prefix}{key}")
+                metric_values.append(torch.tensor(values, dtype=torch.float, device=self.accelerator.device).mean())
+
+        if metric_values:
+            reduced_values = self.accelerator.reduce(torch.stack(metric_values), "mean").tolist()
+            for key, value in zip(metric_keys, reduced_values):
+                logs[key] = value
+
+        mtp_correct = stored_metrics.get("mtp_correct", [])
+        mtp_total = stored_metrics.get("mtp_total", [])
+        if mtp_correct and mtp_total:
+            counts = torch.tensor(
+                [sum(mtp_correct), sum(mtp_total)], dtype=torch.float, device=self.accelerator.device
+            )
+            mtp_correct_sum, mtp_total_sum = self.accelerator.reduce(counts, "sum").tolist()
+            if mtp_total_sum > 0:
+                logs[f"{prefix}mtp_acc"] = mtp_correct_sum / mtp_total_sum
+
+        if split in self._stored_metrics:
+            del self._stored_metrics[split]
+
+        return super().log(logs, *args, **kwargs)

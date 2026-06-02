@@ -131,6 +131,51 @@ def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     return AutoConfig.from_pretrained(config_name_or_path, **init_kwargs)
 
 
+def _configure_deepseek_v3_mtp(config: "PretrainedConfig", model_args: "ModelArguments") -> bool:
+    r"""Configure local DeepSeek-V3 MTP model from YAML args or config.json."""
+    architectures = getattr(config, "architectures", None)
+    has_mtp_arch = isinstance(architectures, list) and "DeepseekV3ForCausalLMMTP" in architectures
+    config_num_mtp_layers = getattr(config, "num_nextn_predict_layers", None)
+    has_config_mtp_layers = config_num_mtp_layers is not None and int(config_num_mtp_layers) > 0
+    has_arg_mtp_layers = (
+        model_args.num_nextn_predict_layers is not None and int(model_args.num_nextn_predict_layers) > 0
+    )
+    enable_mtp = bool(model_args.enable_mtp or has_mtp_arch or has_config_mtp_layers or has_arg_mtp_layers)
+
+    if not enable_mtp:
+        return False
+
+    if getattr(config, "model_type", None) != "deepseek_v3":
+        raise ValueError("DeepSeek-V3 MTP is only supported for `model_type: deepseek_v3`.")
+
+    if model_args.num_nextn_predict_layers is not None:
+        num_mtp_layers = int(model_args.num_nextn_predict_layers)
+    elif config_num_mtp_layers is not None:
+        num_mtp_layers = int(config_num_mtp_layers)
+    else:
+        num_mtp_layers = 1
+
+    if num_mtp_layers <= 0:
+        raise ValueError("`num_nextn_predict_layers` must be positive when DeepSeek-V3 MTP is enabled.")
+
+    mtp_loss_weight = (
+        float(model_args.mtp_loss_weight)
+        if model_args.mtp_loss_weight is not None
+        else float(getattr(config, "mtp_loss_weight", 0.1))
+    )
+
+    setattr(config, "architectures", ["DeepseekV3ForCausalLMMTP"])
+    setattr(config, "num_nextn_predict_layers", num_mtp_layers)
+    setattr(config, "mtp_loss_weight", mtp_loss_weight)
+    setattr(config, "use_cache", False)
+
+    logger.info_rank0(
+        "Enabled DeepSeek-V3 MTP with "
+        f"num_nextn_predict_layers={num_mtp_layers}, mtp_loss_weight={mtp_loss_weight}."
+    )
+    return True
+
+
 def load_model(
     tokenizer: "PreTrainedTokenizer",
     model_args: "ModelArguments",
@@ -142,6 +187,7 @@ def load_model(
     init_kwargs = _get_init_kwargs(model_args)
     config = load_config(model_args)
     patch_config(config, tokenizer, model_args, init_kwargs, is_trainable)
+    enable_deepseek_v3_mtp = _configure_deepseek_v3_mtp(config, model_args)
     apply_liger_kernel(config, model_args, is_trainable, require_logits=(finetuning_args.stage not in ["pt", "sft"]))
 
     model = None
@@ -166,11 +212,18 @@ def load_model(
                 load_class = AutoModelForSeq2SeqLM
             elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio-text for qwen omni
                 load_class = AutoModelForTextToWaveform
+            elif enable_deepseek_v3_mtp:
+                from .model_utils.deepseek_v3_mtp import DeepseekV3ForCausalLMMTP
+
+                load_class = DeepseekV3ForCausalLMMTP
             else:
                 load_class = AutoModelForCausalLM
 
             if model_args.train_from_scratch:
-                model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
+                if enable_deepseek_v3_mtp:
+                    model = load_class(config)
+                else:
+                    model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
             else:
                 model = load_class.from_pretrained(**init_kwargs)
                 if getattr(model.config, "model_type", None) in ["qwen2_5_omni", "qwen3_omni_moe"]:

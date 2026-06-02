@@ -1,11 +1,13 @@
 ### model
-# Megatron DeepSeek-3B (V3 model type) -> LlamaFactory best-effort mapping.
 model_name_or_path: deepseek-ai/DeepSeek-V3-Base
-config_name_or_path: /public/pangxizheng/LLaMA-Factory/dsv3_megatron_config/deepseek_3bv3_megatron_like_config.json
+config_name_or_path: /public/wenweihuang/LLaMA-Factory/configs/deepseek_3bv3_megatron_like_config_fsdp.json
 trust_remote_code: true
 train_from_scratch: true
 flash_attn: fa2
 moe_aux_loss_coef: 1.0e-4
+enable_mtp: true
+num_nextn_predict_layers: 1
+mtp_loss_weight: 0.1
 disable_gradient_checkpointing: false
 
 ### method
@@ -51,4 +53,3 @@ fp16: false
 ddp_timeout: 180000000
 resume_from_checkpoint: null
 use_grouped_gemm_moe: true
-
