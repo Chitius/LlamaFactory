@@ -10,6 +10,8 @@ num_nextn_predict_layers: 1
 mtp_loss_weight: 0.1
 disable_gradient_checkpointing: false
 
+use_hyper_parallel: true
+
 ### method
 stage: pt
 do_train: true
@@ -25,7 +27,7 @@ dataloader_num_workers: 4
 ### output
 output_dir: outputs/deepseekv3_moe/pretrain_dsv3_fsdp2
 logging_steps: 1
-save_steps: 100
+save_steps: 1000
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: false
